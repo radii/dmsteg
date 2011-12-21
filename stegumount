@@ -1,0 +1,58 @@
+#!/bin/bash
+# stegumount: umounts filesystems
+
+# 1. Find entry in /etc/mtab
+# 2. umount it
+# 3. Unload unneeded aspects
+# 4. If final substrate is unneeded loop device, remove it
+
+devormnt="$1"
+
+if [ "`whoami`" != "root" ] ; then
+	echo "Error: not root."
+	exit 1
+fi
+
+if [ ! -b "$devormnt" -a ! -d "$devormnt" ] ; then
+	echo "Usage: $0 <device or mount point>"
+	exit 1
+fi
+
+if [ -b "$devormnt" ] ; then
+	device="$devormnt"
+	mountpoint=`grep "^$devormnt " /etc/mtab | awk '{print $2}'`
+else
+	mountpoint="$devormnt"
+	device=`grep " $devormnt " /etc/mtab | awk '{print $1}'`
+fi
+
+if [ ! -b "$device" -o ! -d "$mountpoint" ] ; then
+	echo "Error: $devormnt does not appear to be mounted"
+	exit 1
+fi
+
+if ! umount "$mountpoint" ; then
+	echo "Failed to umount $mountpoint"
+	exit 1
+fi
+
+while echo $device | grep "^/dev/mapper/steg" >&/dev/null; do
+	substrate=`stegctl substrate "$device"`
+	if ! stegctl unneeded "$device" >&/dev/null; then
+		echo "Done."
+		exit 0
+	fi
+	echo "Unloading $device..."
+	dmsetup remove "$device"
+	stegctl remove "$device"
+	device="$substrate"
+done
+
+if echo $device | grep "^/dev/loop" >&/dev/null; then
+	if stegctl unneeded "$device" >&/dev/null; then
+		echo "Removing $device..."
+		losetup -d "$device"
+	fi
+fi
+
+echo "Done."

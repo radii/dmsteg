@@ -1,0 +1,83 @@
+DM-Steg: a deniably-encrypted block device
+
+For an overview of the Steg specification and DM-Steg, see the .pdf file on http://dmsteg.sourceforge.net
+
+You will need:
+	- libdl. I understand this is part of libc.
+	- A recent version of libdevmapper, distributed inside LVM2: ftp://sources.redhat.com/pub/lvm2/
+	- A libcrypto with XTS support, included in OpenSSL >=1.1.0. This is not yet released so you'll have to go to http://www.openssl.org and grab the development sources from CVS. Rather than updating my system, I find it easier to keep a new libcrypto.a in my home directory and link to it statically. Change the Makefile if you want to link dynamically.
+
+To install:
+	make
+	(as root) make install
+
+To overwrite a device with pseudorandom data (you probably want to do this before you first use Steg on it):
+	stegdisk <device/file>
+		erase 0
+
+To remove all traces of aspects from a device:
+	stegdisk <device/file>
+		nuke 0
+
+To create an encrypted aspect directly on a block device:
+	stegdisk <device/file>
+		new 0 100% MyAspect
+		write
+		quit
+
+To create two equal sized encrypted aspects inside a transparent aspect:
+	stegdisk <device/file>
+		new 0 100% Transparency -
+		open 0
+		new 0 50% AspectOne
+		new 0 100% AspectTwo
+		write
+		quit
+
+To set up your system for mounting aspects:
+	Apply the kernel patch:
+		cd linux-3.2-rc3
+		patch -p1 < dmsteg-0.9-linux-3.2-rc3.patch
+	Use menuconfig to enable DM-Steg. Enable:
+		'General setup' -> 'Prompt for development and/or incomplete code/drivers'
+		'Device drivers' -> 'Multiple device driver support (RAID and LVM)' -> 'DM-Steg target (EXPERIMENTAL)'
+	Build and install a lovely new kernel:
+		make
+		make install
+		make modules_install
+	Add stegd to your bootup scripts
+	Reboot with new kernel
+
+To create a filesystem on an aspect:
+	stegsetup <block device>
+	mkreiserfs /dev/mapper/stegX	(the device stegsetup reported last)
+	dmsetup remove_all
+
+Once a filesystem is created, mount it like this:
+	stegmount <block device> /mnt
+
+And unmount it like this:
+	stegumount <block device>
+Or this:
+	stegumount /mnt
+	dmsetup remove /dev/mapper/stegX
+
+Good luck!
+
+
+
+And if you like this software, feel free to send me Bitcoins :)
+
+	1BteMJCcWNKnPbJraCEM5HteiCCZS8NGTp
+
+DM-Steg home page http://dmsteg.sourceforge.net
+
+DM-Steg is hereby released in its entirety into the public domain. This means you may do with DM-Steg whatever you please, wherever you please, whenever you please, inasmuch as you please, for the rest of eternity. Having said that, I would kindly ask that you:
+
+	1. Release all modified and derived works into the public domain
+	2. Do not deviate from the specification without very good reason
+	3. Give credit where credit is due
+
+Also, please see the below boilerplate:
+
+THIS SOFTWARE IS PROVIDED BY LEOPOLD SAMULIS ''AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL LEOPOLD SAMULIS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. LEOPOLD SAMULIS AND CONTRIBUTORS SHALL ALSO NOT BE LIABLE IF USE, POSESSION, OR TRANSMISSION OF THIS SOFTWARE GETS YOU IN TROUBLE WITH WHICHEVER LEGAL SYSTEM YOU LIVE UNDER.

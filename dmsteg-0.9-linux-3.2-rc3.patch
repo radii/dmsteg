@@ -1,0 +1,2815 @@
+diff -uNr original/CREDITS modified/CREDITS
+--- original/CREDITS	2011-11-24 04:20:28.000000000 +0000
++++ modified/CREDITS	2011-11-24 16:43:47.547304048 +0000
+@@ -3112,6 +3112,10 @@
+ E: wsalamon@nai.com
+ D: portions of the Linux Security Module (LSM) framework and security modules
+ 
++N: Leopold Samulis
++E: anagon@gmail.com
++D: DM-Steg, SXTS, ffs64.h
++
+ N: Robert Sanders
+ E: gt8134b@prism.gatech.edu
+ D: Dosemu
+diff -uNr original/MAINTAINERS modified/MAINTAINERS
+--- original/MAINTAINERS	2011-11-24 04:20:28.000000000 +0000
++++ modified/MAINTAINERS	2011-11-24 16:43:44.575302997 +0000
+@@ -2262,6 +2262,13 @@
+ S:	Supported
+ F:	fs/dlm/
+ 
++DM-STEG
++M:	Leopold Samulis <anagon@gmail.com>
++W:	http://dmsteg.sf.net
++S:	Maintained
++F:	drivers/md/dm-steg*
++F:	crypto/sxts.c
++
+ DMA GENERIC OFFLOAD ENGINE SUBSYSTEM
+ M:	Vinod Koul <vinod.koul@intel.com>
+ M:	Dan Williams <dan.j.williams@intel.com>
+diff -uNr original/crypto/Kconfig modified/crypto/Kconfig
+--- original/crypto/Kconfig	2011-11-24 04:20:28.000000000 +0000
++++ modified/crypto/Kconfig	2011-11-24 16:44:04.947297507 +0000
+@@ -272,6 +272,15 @@
+ 	  key size 256, 384 or 512 bits. This implementation currently
+ 	  can't handle a sectorsize which is not a multiple of 16 bytes.
+ 
++config CRYPTO_SXTS
++	tristate "SXTS support (EXPERIMENTAL)"
++	depends on EXPERIMENTAL
++	select CRYPTO_BLKCIPHER
++	select CRYPTO_MANAGER
++	select CRYPTO_GF128MUL
++	help
++	  SXTS: Simplified version of XTS used by dm-steg.
++
+ comment "Hash modes"
+ 
+ config CRYPTO_HMAC
+diff -uNr original/crypto/Makefile modified/crypto/Makefile
+--- original/crypto/Makefile	2011-11-24 04:20:28.000000000 +0000
++++ modified/crypto/Makefile	2011-11-24 16:44:08.240298156 +0000
+@@ -54,6 +54,7 @@
+ obj-$(CONFIG_CRYPTO_CTS) += cts.o
+ obj-$(CONFIG_CRYPTO_LRW) += lrw.o
+ obj-$(CONFIG_CRYPTO_XTS) += xts.o
++obj-$(CONFIG_CRYPTO_SXTS) += sxts.o
+ obj-$(CONFIG_CRYPTO_CTR) += ctr.o
+ obj-$(CONFIG_CRYPTO_GCM) += gcm.o
+ obj-$(CONFIG_CRYPTO_CCM) += ccm.o
+diff -uNr original/crypto/sxts.c modified/crypto/sxts.c
+--- original/crypto/sxts.c	1970-01-01 01:00:00.000000000 +0100
++++ modified/crypto/sxts.c	2011-11-24 16:44:11.351298044 +0000
+@@ -0,0 +1,243 @@
++/* SXTS: shortened version of XTS, used by dm-steg
++ *
++ * Based on xts.c
++ * 	which is Copyright (c) 2007 Rik Snel <rsnel@cube.dyndns.org>
++ * 	and also Copyright (c) 2006 Herbert Xu <herbert@gondor.apana.org.au>
++ * and modified by Leopold Samulis <anagon@gmail.com> in 2011.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License as published by the Free
++ * Software Foundation; either version 2 of the License, or (at your option)
++ * any later version.
++ */
++#include <crypto/algapi.h>
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++
++#include <crypto/b128ops.h>
++#include <crypto/gf128mul.h>
++
++struct priv {
++	struct crypto_cipher *child;
++};
++
++static int setkey(struct crypto_tfm *parent, const u8 *key,
++		  unsigned int keylen)
++{
++	struct priv *ctx = crypto_tfm_ctx(parent);
++	struct crypto_cipher *child = ctx->child;
++	u32 *flags = &parent->crt_flags;
++	int err;
++
++	/* Only 256-bit sxts supported (128-bit key, 128-bit ivec) */
++	if (unlikely(keylen != 16)) {
++		*flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
++		return -EINVAL;
++	}
++	crypto_cipher_clear_flags(child, CRYPTO_TFM_REQ_MASK);
++	crypto_cipher_set_flags(child, crypto_tfm_get_flags(parent) &
++				       CRYPTO_TFM_REQ_MASK);
++	err = crypto_cipher_setkey(child, key, keylen);
++	if (unlikely(err))
++		return err;
++
++	crypto_tfm_set_flags(parent, crypto_cipher_get_flags(child) &
++				     CRYPTO_TFM_RES_MASK);
++
++	return 0;
++}
++
++struct sinfo {
++	be128 *t;
++	struct crypto_tfm *tfm;
++	void (*fn)(struct crypto_tfm *, u8 *, const u8 *);
++};
++
++static inline void sxts_round(struct sinfo *s, void *dst, const void *src)
++{
++	be128_xor(dst, s->t, src);		/* PP <- T xor P */
++	s->fn(s->tfm, dst, dst);		/* CC <- E(Key1,PP) */
++	be128_xor(dst, dst, s->t);		/* C <- T xor CC */
++}
++
++static int crypt(struct blkcipher_desc *d,
++		 struct blkcipher_walk *w, struct priv *ctx,
++		 void (*fn)(struct crypto_tfm *, u8 *, const u8 *))
++{
++	int err;
++	unsigned int avail;
++	const int bs = crypto_cipher_blocksize(ctx->child);
++	struct sinfo s = {
++		.tfm = crypto_cipher_tfm(ctx->child),
++		.fn = fn
++	};
++	u8 *wsrc;
++	u8 *wdst;
++
++	err = blkcipher_walk_virt(d, w);
++	if (unlikely(!w->nbytes))
++		return err;
++
++	/* no xts tweak encrypting */
++	s.t = (be128 *)w->iv;
++	avail = w->nbytes;
++
++	wsrc = w->src.virt.addr;
++	wdst = w->dst.virt.addr;
++
++	goto first;
++
++	for (;;) {
++		do {
++			gf128mul_x_ble(s.t, s.t);
++first:
++			sxts_round(&s, wdst, wsrc);
++
++			wsrc += bs;
++			wdst += bs;
++		} while ((avail -= bs) >= bs);
++
++		err = blkcipher_walk_done(d, w, avail);
++		if (!w->nbytes)
++			break;
++
++		avail = w->nbytes;
++
++		wsrc = w->src.virt.addr;
++		wdst = w->dst.virt.addr;
++	}
++
++	return err;
++}
++
++static int encrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		   struct scatterlist *src, unsigned int nbytes)
++{
++	struct priv *ctx = crypto_blkcipher_ctx(desc->tfm);
++	struct blkcipher_walk w;
++
++	blkcipher_walk_init(&w, dst, src, nbytes);
++	return crypt(desc, &w, ctx,
++		     crypto_cipher_alg(ctx->child)->cia_encrypt);
++}
++
++static int decrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		   struct scatterlist *src, unsigned int nbytes)
++{
++	struct priv *ctx = crypto_blkcipher_ctx(desc->tfm);
++	struct blkcipher_walk w;
++
++	blkcipher_walk_init(&w, dst, src, nbytes);
++	return crypt(desc, &w, ctx,
++		     crypto_cipher_alg(ctx->child)->cia_decrypt);
++}
++
++static int init_tfm(struct crypto_tfm *tfm)
++{
++	struct crypto_cipher *cipher;
++	struct crypto_instance *inst = (void *)tfm->__crt_alg;
++	struct crypto_spawn *spawn = crypto_instance_ctx(inst);
++	struct priv *ctx = crypto_tfm_ctx(tfm);
++	u32 *flags = &tfm->crt_flags;
++
++	cipher = crypto_spawn_cipher(spawn);
++	if (unlikely(IS_ERR(cipher)))
++		return PTR_ERR(cipher);
++
++	if (unlikely(crypto_cipher_blocksize(cipher) != 16)) {
++		*flags |= CRYPTO_TFM_RES_BAD_BLOCK_LEN;
++		crypto_free_cipher(cipher);
++		return -EINVAL;
++	}
++
++	ctx->child = cipher;
++
++	return 0;
++}
++
++static void exit_tfm(struct crypto_tfm *tfm)
++{
++	struct priv *ctx = crypto_tfm_ctx(tfm);
++	crypto_free_cipher(ctx->child);
++}
++
++static struct crypto_instance *alloc(struct rtattr **tb)
++{
++	struct crypto_instance *inst;
++	struct crypto_alg *alg;
++	int err;
++
++	err = crypto_check_attr_type(tb, CRYPTO_ALG_TYPE_BLKCIPHER);
++	if (unlikely(err))
++		return ERR_PTR(err);
++
++	alg = crypto_get_attr_alg(tb, CRYPTO_ALG_TYPE_CIPHER,
++				  CRYPTO_ALG_TYPE_MASK);
++	if (unlikely(IS_ERR(alg)))
++		return ERR_CAST(alg);
++
++	inst = crypto_alloc_instance("sxts", alg);
++	if (unlikely(IS_ERR(inst)))
++		goto out_put_alg;
++
++	inst->alg.cra_flags = CRYPTO_ALG_TYPE_BLKCIPHER;
++	inst->alg.cra_priority = alg->cra_priority;
++	inst->alg.cra_blocksize = alg->cra_blocksize;
++
++	if (alg->cra_alignmask < 7)
++		inst->alg.cra_alignmask = 7;
++	else
++		inst->alg.cra_alignmask = alg->cra_alignmask;
++
++	inst->alg.cra_type = &crypto_blkcipher_type;
++
++	inst->alg.cra_blkcipher.ivsize = alg->cra_blocksize;
++	inst->alg.cra_blkcipher.min_keysize = 16;
++	inst->alg.cra_blkcipher.max_keysize = 16;
++
++	inst->alg.cra_ctxsize = sizeof(struct priv);
++
++	inst->alg.cra_init = init_tfm;
++	inst->alg.cra_exit = exit_tfm;
++
++	inst->alg.cra_blkcipher.setkey = setkey;
++	inst->alg.cra_blkcipher.encrypt = encrypt;
++	inst->alg.cra_blkcipher.decrypt = decrypt;
++
++out_put_alg:
++	crypto_mod_put(alg);
++	return inst;
++}
++
++static void free(struct crypto_instance *inst)
++{
++	crypto_drop_spawn(crypto_instance_ctx(inst));
++	kfree(inst);
++}
++
++static struct crypto_template crypto_tmpl = {
++	.name = "sxts",
++	.alloc = alloc,
++	.free = free,
++	.module = THIS_MODULE,
++};
++
++static int __init crypto_module_init(void)
++{
++	return crypto_register_template(&crypto_tmpl);
++}
++
++static void __exit crypto_module_exit(void)
++{
++	crypto_unregister_template(&crypto_tmpl);
++}
++
++module_init(crypto_module_init);
++module_exit(crypto_module_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("SXTS block cipher mode");
+diff -uNr original/drivers/md/Kconfig modified/drivers/md/Kconfig
+--- original/drivers/md/Kconfig	2011-11-24 04:20:28.000000000 +0000
++++ modified/drivers/md/Kconfig	2011-11-24 16:44:50.928297752 +0000
+@@ -370,4 +370,14 @@
+        ---help---
+          A target that intermittently fails I/O for debugging purposes.
+ 
++config DM_STEG
++	tristate "DM-Steg target (EXPERIMENTAL)"
++	depends on BLK_DEV_DM && EXPERIMENTAL
++	select CRYPTO_AES
++	select CRYPTO_SXTS
++	select CRYPTO_SHA256
++	select CRYPTO_SHA512
++	---help---
++	  A target that facilitates mounting of deniably encrypted devices.
++
+ endif # MD
+diff -uNr original/drivers/md/Makefile modified/drivers/md/Makefile
+--- original/drivers/md/Makefile	2011-11-24 04:20:28.000000000 +0000
++++ modified/drivers/md/Makefile	2011-11-24 16:44:54.834304582 +0000
+@@ -42,6 +42,7 @@
+ obj-$(CONFIG_DM_ZERO)		+= dm-zero.o
+ obj-$(CONFIG_DM_RAID)	+= dm-raid.o
+ obj-$(CONFIG_DM_THIN_PROVISIONING)	+= dm-thin-pool.o
++obj-$(CONFIG_DM_STEG)           += dm-steg.o
+ 
+ ifeq ($(CONFIG_DM_UEVENT),y)
+ dm-mod-objs			+= dm-uevent.o
+diff -uNr original/drivers/md/dm-steg.c modified/drivers/md/dm-steg.c
+--- original/drivers/md/dm-steg.c	1970-01-01 01:00:00.000000000 +0100
++++ modified/drivers/md/dm-steg.c	2011-11-26 13:23:29.101047640 +0000
+@@ -0,0 +1,2226 @@
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/wait.h>
++#include <linux/bio.h>
++#include <linux/slab.h>
++#include <linux/device-mapper.h>
++#include <linux/crypto.h>
++#include <linux/scatterlist.h>
++#include <linux/random.h>
++#include <linux/list.h>
++#include <asm-generic/bitops/ffs64.h>
++#include "dm-steg.h"
++
++#define DM_MSG_PREFIX "steg"
++
++static DEFINE_SPINLOCK(steg_global_lock);
++
++static void xor_random(void *dst, void *src, int bytes)
++{
++	get_random_bytes(dst, bytes);
++	while(bytes--)
++		*(u8 *)dst++ ^= *(u8 *)src++;
++}
++
++static inline u64 get_offset(struct aspect *a, struct block *b)
++{
++	return le64_to_cpu(b->offset & a->block_mask);
++}
++
++static inline void set_offset(struct aspect *a, struct block *b, u64 offset)
++{
++	b->offset &= ~a->block_mask;
++	b->offset |= cpu_to_le64(offset);
++}
++
++static inline struct keyfrag *get_keyfrag_address(struct aspect *a,
++								unsigned int kf)
++{
++	return &a->atom_keyfrag[kf >> KEYFRAG_PAGE_SHIFT][kf &
++							~KEYFRAG_PAGE_MASK];
++}
++
++static inline struct keyfrag *get_atom_keyfrag(struct aspect *a, u64 offset)
++{
++	return get_keyfrag_address(a, (offset & ~a->block_mask) >>
++								a->atom_shift);
++}
++
++/* Returns on-disk offset of keyfrag within header block */
++static inline unsigned int get_offset_of_keyfrag(struct aspect *a,
++							unsigned int keyfrag)
++{
++	return a->keyfrags_offset + (keyfrag << KEYFRAG_SHIFT) +
++					sizeof(struct meta_tail) * (keyfrag /
++					(a->meta_atom_bytes >> KEYFRAG_SHIFT));
++}
++
++/* Returns number of keyfrag required to load every other keyfrag */
++static unsigned int get_seed_keyfrag(struct aspect *a)
++{
++	unsigned int tmp;
++	unsigned int keyfrag;
++	unsigned int offset = 0;
++	do {
++		tmp = offset;
++		keyfrag = (offset & ~a->block_mask) >> a->atom_shift;
++		offset = get_offset_of_keyfrag(a, keyfrag);
++	} while(offset != tmp);
++	return keyfrag;
++}
++
++static inline struct block *get_block_address(struct aspect *a,
++					struct block **index, u64 offset)
++{
++	return &index[offset >> (a->block_shift + BLOCK_PAGE_SHIFT)]
++			[(offset >> a->block_shift) & ~BLOCK_PAGE_MASK];
++}
++
++static inline u64 translate_address(struct aspect *a, u64 offset)
++{
++	return get_offset(a, get_block_address(a, a->block, offset))
++						+ (offset & ~a->block_mask);
++}
++
++static inline int request_contains_only_aligned_pages(struct steg_request *r)
++{
++	return !(((u64)r->bio->bi_sector << 9) & ~r->a->atom_mask) &&
++			r->bio->bi_size == r->bio->bi_vcnt << PAGE_SHIFT;
++}
++
++static void copy_to_from_array(void **array, size_t offset, void *mem,
++						size_t total, int direction)
++{
++	size_t bytes;
++	while(total) {
++		bytes = PAGE_SIZE - (offset & ~PAGE_MASK) > total ? total :
++					PAGE_SIZE - (offset & ~PAGE_MASK);
++		if(direction)
++			memcpy(mem, array[offset >> PAGE_SHIFT] +
++						(offset & ~PAGE_MASK), bytes);
++		else
++			memcpy(array[offset >> PAGE_SHIFT] +
++					(offset & ~PAGE_MASK), mem, bytes);
++
++		mem += bytes;
++		offset += bytes;
++		total -= bytes;
++	}
++}
++#define	copy_from_array(a, b, c, d)	copy_to_from_array(a, b, c, d, 1)
++#define copy_to_array(a, b, c, d)	copy_to_from_array(a, b, c, d, 0)
++
++/* Returns NULL-terminated array of pointers to pages */
++static void *alloc_page_array(unsigned int bytes, int structs)
++{
++	void **array;
++	int i;
++	unsigned int pages  = DIV_ROUND_UP(bytes, PAGE_SIZE);
++	array = kmalloc((pages + 1) * sizeof(void *), GFP_KERNEL);
++	if(!array)
++		return NULL;
++
++	for(i = 0; i < pages; i++) {
++		if(structs)
++			array[i] = alloc_page(GFP_NOIO);
++		else
++			array[i] = (void *)__get_free_page(GFP_KERNEL);
++
++		if(!array[i]) {
++			while(--i > 0)
++				if(structs)
++					__free_page(array[i]);
++				else
++					free_page((unsigned long)array[i]);
++
++			kfree(array);
++			return NULL;
++		}
++	}
++	array[i] = NULL;
++	return array;
++}
++
++static void free_page_array(void *array)
++{
++	unsigned long *page = array;
++	if(array) {
++		while(*page) {
++			memset((void *)(*page), 0, PAGE_SIZE);
++			free_page(*(page++));
++		}
++		kzfree(array);
++	}
++}
++
++static void bio_complete(struct bio *bio, int e)
++{
++	struct bio_meta *meta = bio->bi_private;
++	bio_put(bio);
++	if(e)
++		meta->error = e;
++
++	if(atomic_dec_and_test(&meta->incomplete))
++		wake_up(meta->q);
++}
++
++static int submit_bio_and_wait(int rw, struct bio *bio)
++{
++	DECLARE_WAIT_QUEUE_HEAD(q);
++	struct bio_meta meta = { .error = 0, .q = &q };
++	bio->bi_private = &meta;
++	bio->bi_end_io = bio_complete;
++	atomic_set(&meta.incomplete, 1);
++	submit_bio(rw, bio);
++	wait_event(q, !atomic_read(&meta.incomplete));
++	return meta.error;
++}
++
++/* offset is into underlying device */
++static int rw_atom(struct aspect *a, u64 offset, void *data, int rw)
++{
++	int e;
++	struct bio *bio = bio_alloc(GFP_NOIO, 1);
++	if(!bio)
++		return -ENOMEM;
++
++	bio->bi_bdev = a->device->bdev;
++	bio->bi_sector = offset >> 9;
++	bio_add_page(bio, virt_to_page(data), a->atom_bytes,
++						offset_in_page(data));
++	e = submit_bio_and_wait(rw, bio);
++	return e;
++}
++
++/* *data length should be a->atom_bytes.
++ * Warning: rnd64 must be at data + a->meta_atom_bytes + META_HASH_BYTES */
++static int calculate_metadata_hash(struct aspect *a, void *data,
++			struct block *block, struct keyfrag *keyfrag, void *dst)
++{
++	u8 tmp[128];
++	u8 hash[64];
++	struct crypto_hash *tfm;
++	struct scatterlist sg;
++	struct hash_desc desc;
++	tfm = crypto_alloc_hash("sha512", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(tfm))
++		return PTR_ERR(tfm);
++
++	desc.tfm = tfm;
++	desc.flags = 0;
++	crypto_hash_init(&desc);
++	sg_init_one(&sg, data, a->meta_atom_bytes);
++	crypto_hash_update(&desc, &sg, sg.length);
++	memcpy(tmp, a->salt, 56);
++	memcpy(tmp + 64, block, sizeof(*block));
++	memcpy(tmp + 96, keyfrag, sizeof(*keyfrag));
++	*(u64 *)&tmp[56] = *(u64 *)(data + a->meta_atom_bytes
++							+ META_HASH_BYTES);
++	sg_init_one(&sg, tmp, 128);
++	crypto_hash_update(&desc, &sg, sg.length);
++	crypto_hash_final(&desc, hash);
++	crypto_free_hash(tfm);
++	memcpy(dst, hash, META_HASH_BYTES);
++	return 0;
++}
++
++static int calculate_metadata_key(struct aspect *a, struct block *b,
++				struct keyfrag *kf, void *hash, void *key)
++{
++	u8 tmp[KEY_BYTES * 2];
++	struct crypto_hash *tfm;
++	struct scatterlist sg;
++	struct hash_desc desc;
++	tfm = crypto_alloc_hash("sha256", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(tfm))
++		return PTR_ERR(tfm);
++
++	desc.tfm = tfm;
++	desc.flags = 0;
++	crypto_hash_init(&desc);
++	sg_init_one(&sg, hash, META_HASH_BYTES);
++	crypto_hash_update(&desc, &sg, sg.length);
++	memcpy(tmp, b, KEY_BYTES);
++	memcpy(tmp + KEY_BYTES, kf, KEY_BYTES);
++	sg_init_one(&sg, tmp, KEY_BYTES * 2);
++	crypto_hash_update(&desc, &sg, sg.length);
++	crypto_hash_final(&desc, key);
++	crypto_free_hash(tfm);
++	return 0;
++}
++
++/* First 128-bits of key is the AES block cipher key
++ * Second 128-bits of key is the initial tweak value (ivec) */
++static inline void steg_set_key(struct crypto_blkcipher *tfm, u8 *key)
++{
++	crypto_blkcipher_setkey(tfm, key, KEY_BYTES / 2);
++	memcpy(crypto_blkcipher_crt(tfm)->iv, key + (KEY_BYTES / 2),
++							KEY_BYTES / 2);
++}
++
++/* Warning: *data should be a->atom_bytes, not a->meta_atom_bytes */
++static int read_meta_atom(struct aspect *a, u64 offset, void *data)
++{
++	u8 key[KEY_BYTES];
++	u8 hash[META_HASH_BYTES];
++	struct blkcipher_desc desc;
++	struct scatterlist sg;
++	int e = 0;
++	struct block *b = get_block_address(a, a->header_block, offset);
++	struct keyfrag *keyfrag = get_atom_keyfrag(a, offset);
++	struct crypto_blkcipher *tfm;
++	tfm = crypto_alloc_blkcipher("sxts(aes)", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(tfm))
++		return PTR_ERR(tfm);
++
++	desc.tfm = tfm;
++	desc.flags = 0;
++	if((e = rw_atom(a, get_offset(a, b) + (offset & ~a->block_mask),
++							data, READ)))
++		goto end;
++
++	if((e = calculate_metadata_key(a, b, keyfrag, data
++						+ a->meta_atom_bytes, key)))
++		goto end;
++
++	steg_set_key(tfm, key);
++	sg_init_one(&sg, data, a->meta_atom_bytes);
++	crypto_blkcipher_decrypt(&desc, &sg, &sg, sg.length);
++	if((e = calculate_metadata_hash(a, data, b, keyfrag, hash)))
++		goto end;
++
++	if(memcmp(data + a->meta_atom_bytes, hash, META_HASH_BYTES)) {
++		DMERR("hash mismatch when reading meta atom");
++		e = -EINVAL;
++	}
++	end:
++	crypto_free_blkcipher(tfm);
++	return e;
++}
++
++/* Data atom key = sha256(struct block||struct keyfrag)
++ * Caller provides hash_tfm, because:
++ * 	1. saves repeated allocation/deallocation for multi atom bios
++ * 	2. error checking can take place outside main loops */
++static void set_data_atom_key(struct crypto_blkcipher *cipher_tfm, struct aspect
++	*a, struct block **index, u64 offset, struct crypto_hash *hash_tfm)
++{
++	struct scatterlist sg;
++	struct hash_desc desc;
++	u8 two_keyfrags[KEYFRAG_BYTES * 2];
++	u8 atom_key[KEY_BYTES];
++	desc.tfm = hash_tfm;
++	desc.flags = 0;
++	memcpy(two_keyfrags, get_block_address(a, index, offset),
++								KEYFRAG_BYTES);
++	memcpy(&two_keyfrags[KEYFRAG_BYTES], get_atom_keyfrag(a, offset),
++								KEYFRAG_BYTES);
++	sg_init_one(&sg, two_keyfrags, KEYFRAG_BYTES * 2);
++	crypto_hash_digest(&desc, &sg, KEYFRAG_BYTES * 2, atom_key);
++	steg_set_key(cipher_tfm, atom_key);
++}
++
++static struct block *get_block_from_pyramid(struct aspect *a, u64 pyramid_block)
++{
++	u64 blocknum = pyramid_blocknum(pyramid_block);
++	switch(pyramid_type(pyramid_block)) {
++	case PYRAMID_HEADER:
++		return *a->header_block;
++
++	case PYRAMID_DATA:
++		return &a->block[blocknum >> BLOCK_PAGE_SHIFT][blocknum
++							& ~BLOCK_PAGE_MASK];
++	default:
++		/* free block hack - be careful */
++		return (void *)&a->journal->dst_offset;
++	}
++}
++
++/* Lower numbered layers (higher in pyramid) are more aligned */
++static int get_layer_from_offset(u64 offset)
++{
++	return offset ? 65 - ffs64(offset) : 0;
++}
++
++/* Appends block to appropriate level of pyramid. */
++static void add_block_to_pyramid(struct aspect *a, int *layer_to_layer,
++							u64 pyramid_block)
++{
++	u64 *target;
++	int layer;
++	struct block *block = get_block_from_pyramid(a, pyramid_block);
++	layer = layer_to_layer[get_layer_from_offset(get_offset(a, block))];
++	target = &a->pyramid[layer][a->blocks_in_layer[layer]
++		>> U64_PAGE_SHIFT][a->blocks_in_layer[layer] & ~U64_PAGE_MASK];
++	*target = pyramid_block;
++	if(pyramid_type(pyramid_block) == PYRAMID_FREE_BLOCK) {
++		DMINFO("adding free block to pyramid. layer %i\n", layer);
++		a->free_pyramid_block = target;
++		a->free_block_layer = layer;
++	}
++	a->blocks_in_layer[layer]++;
++}
++
++/* 1. count number of blocks in each possible layer of pyramid (MAX_LAYERS)
++ * 2. count occupied layers
++ * 3. allocate pyramid, ignoring unoccupied layers
++ * 4. add blocks to pyramid */
++static int build_pyramid(struct aspect *a)
++{
++	int e = -ENOMEM, i, layer;
++	int *blocks_in_every_layer = NULL;
++	int *layer_to_layer = NULL;
++	DMINFO("building pyramid...");
++	blocks_in_every_layer = kzalloc(sizeof(int) * MAX_LAYERS, GFP_KERNEL);
++	if(!blocks_in_every_layer)
++		return -ENOMEM;
++
++	/* Count number of blocks in each possible layer of the pyramid */
++	blocks_in_every_layer[get_layer_from_offset(le64_to_cpu(
++						a->journal->dst_offset))]++;
++	blocks_in_every_layer[get_layer_from_offset(get_offset(a,
++						*a->header_block))]++;
++	for(i = 0; i < a->blocks; i++)
++		blocks_in_every_layer[get_layer_from_offset(get_offset(a,
++					&a->block[i >> KEYFRAG_PAGE_SHIFT]
++					[i & ~KEYFRAG_PAGE_MASK]))]++;
++
++	/* Work out how many layers actually contain blocks */
++	for(a->layers = i = 0; i < MAX_LAYERS; i++)
++		if(blocks_in_every_layer[i])
++			a->layers++;
++
++	DMINFO("a->layers == %i", a->layers);
++	/* Allocate pyramid */
++	a->pyramid = kmalloc(a->layers * sizeof(void *), GFP_KERNEL);
++	a->blocks_in_layer = kzalloc(a->layers * sizeof(int), GFP_KERNEL);
++	layer_to_layer = kzalloc(sizeof(int) * MAX_LAYERS, GFP_KERNEL);
++	if(!a->pyramid||!a->blocks_in_layer||!layer_to_layer)
++		goto end;
++
++	for(layer = i = 0; i < MAX_LAYERS; i++) {
++		if(blocks_in_every_layer[i]) {
++			a->pyramid[layer] = alloc_page_array(sizeof(u64) *
++						blocks_in_every_layer[i], 0);
++			if(!a->pyramid[layer]) {
++				while(layer--)
++					free_page_array(a->pyramid[layer]);
++
++				goto end;
++			}
++			layer_to_layer[i] = layer++;
++		}
++	}
++	/* Add blocks to pyramid */
++	add_block_to_pyramid(a, layer_to_layer, PYRAMID_FREE_BLOCK);
++	add_block_to_pyramid(a, layer_to_layer, PYRAMID_HEADER);
++	for(i = 0; i < a->blocks; i++)
++		add_block_to_pyramid(a, layer_to_layer, i | PYRAMID_DATA);
++
++	for(layer = 0; layer < a->layers; layer++) {
++		DMINFO("%i blocks in layer %i: ", a->blocks_in_layer[layer],
++									layer);
++		DMINFO("%llx ", a->pyramid[layer][0][0]);
++	}
++	e = 0;
++	end:
++	kzfree(blocks_in_every_layer);
++	kzfree(layer_to_layer);
++	if(e)
++		a->layers = 0;	/* for steg_dtr's sake */
++
++	return e;
++}
++
++/* Journal atom comes after after header atom */
++static int load_journal(struct aspect *a)
++{
++	int e, i;
++	DMINFO("dm-steg: loading journal");
++	a->journal = kmalloc(a->atom_bytes, GFP_KERNEL);
++	if(!a->journal)
++		return -ENOMEM;
++
++	if((e = read_meta_atom(a, a->journal_offset, (void *)a->journal)))
++		return e;
++
++	if(a->journal->block_being_moved) {
++		DMERR("journal not clean");
++		return -EUCLEAN;
++	}
++	DMINFO("journal->dst == %llx", le64_to_cpu(a->journal->dst_offset));
++	for(i = 0; a->journal->promoted[i] && i < MAX_LAYERS; i++)
++		DMINFO("promoted[%i] == %llx", i, le64_to_cpu(
++						a->journal->promoted[i]));
++
++	if(i == MAX_LAYERS) {
++		DMERR("journal->promoted not 0-terminated");
++		return -EINVAL;
++	}
++	a->blocks_promoted = i;
++	return 0;
++}
++
++/* Load backwards from first keyfrag stored in header and forwards from second.
++ * a->atom_keyfrag size should be multiple of a->meta_atom_bytes */
++static int load_keyfrags(struct aspect *a)
++{
++	unsigned int keyfrag;
++	unsigned int src;
++	unsigned int dst;
++	int e = 0;
++	void *tmp = kmalloc(a->meta_atom_bytes, GFP_KERNEL);
++	if(!tmp)
++		return -ENOMEM;
++
++	keyfrag = get_seed_keyfrag(a);
++	src = get_offset_of_keyfrag(a, keyfrag) & a->atom_mask;
++	dst = keyfrag << KEYFRAG_SHIFT;
++	dst -= dst % a->meta_atom_bytes;
++	while(src >= a->keyfrags_offset) {
++		if((e = read_meta_atom(a, src, tmp)))
++			goto end;
++
++		copy_to_array((void **)a->atom_keyfrag, dst, tmp,
++							a->meta_atom_bytes);
++		src -= a->atom_bytes;
++		dst -= a->meta_atom_bytes;
++	}
++	keyfrag = get_seed_keyfrag(a);
++	src = get_offset_of_keyfrag(a, keyfrag) & a->atom_mask;
++	dst = keyfrag * sizeof(struct keyfrag);
++	dst -= dst % a->meta_atom_bytes;
++	while(dst < a->atoms_per_block * sizeof(struct keyfrag)) {
++		if((e = read_meta_atom(a, src, tmp)))
++			goto end;
++
++		copy_to_array((void **)a->atom_keyfrag, dst, tmp,
++							a->meta_atom_bytes);
++		src += a->atom_bytes;
++		dst += a->meta_atom_bytes;
++	}
++	end:
++	kzfree(tmp);
++	return e;
++}
++
++/* Total must be multiple of a->meta_atom_bytes */
++static int read_meta_data(struct aspect *a, u64 start, u64 total, void **dst)
++{
++	int e;
++	size_t offset = 0;
++	void *tmp = kmalloc(a->atom_bytes, GFP_KERNEL);
++	if(!tmp)
++		return -ENOMEM;
++
++	while(total) {
++		if((e = read_meta_atom(a, start, tmp)))
++			break;
++
++		copy_to_array(dst, offset, tmp, a->meta_atom_bytes);
++		start += a->atom_bytes;
++		offset += a->meta_atom_bytes;
++		total -= a->meta_atom_bytes;
++	}
++	kzfree(tmp);
++	return e;
++}
++
++/* a->block is used by steg_map to handle read/writes to aspect. */
++static int load_index_table(struct aspect *a)
++{
++	unsigned int bytes = roundup((a->blocks + (a->shuffling ? 1 : 0))
++					<< BLOCK_SHIFT, a->meta_atom_bytes);
++	if(!(a->block = alloc_page_array(bytes, 0)))
++		return -ENOMEM;
++
++	return read_meta_data(a, a->index_offset, bytes, (void *)a->block);
++}
++
++/* Loads and decrypts the header sector. Also allocates a->atom_keyfrag */
++static int load_header(struct aspect *a, u64 header_block_offset)
++{
++	u8 hash[32];
++	struct aspect_disk_header_enc *ciphertext;
++	struct aspect_disk_header *header;
++	struct crypto_blkcipher *cipher_tfm;
++	struct crypto_hash *hash_tfm;
++	struct blkcipher_desc cipher_desc;
++	struct hash_desc hash_desc;
++	struct scatterlist sg;
++	int e = -EINVAL;
++	hash_tfm = crypto_alloc_hash("sha256", 0, CRYPTO_ALG_ASYNC);
++	if(unlikely(IS_ERR(hash_tfm))) {
++		a->ti->error = "crypto_alloc_hash";
++		return PTR_ERR(hash_tfm);
++	}
++	hash_desc.tfm = hash_tfm;
++	hash_desc.flags = 0;
++	cipher_tfm = crypto_alloc_blkcipher("sxts(aes)", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(cipher_tfm)) {
++		a->ti->error = "crypto_alloc_blkcipher";
++		crypto_free_hash(hash_tfm);
++		return PTR_ERR(cipher_tfm);
++	}
++	cipher_desc.tfm = cipher_tfm;
++	cipher_desc.flags = 0;
++	ciphertext = kmalloc(a->device->bdev->bd_block_size, GFP_KERNEL);
++	if(!ciphertext) {
++		a->ti->error = "kmalloc";
++		e = -ENOMEM;
++		goto end;
++	}
++	header = &ciphertext->header;
++	/* Read in at least a sector */
++	a->atom_bytes = a->device->bdev->bd_block_size;
++	if(rw_atom(a, header_block_offset, ciphertext, READ)) {
++		e = -EIO;
++		goto end;
++	}
++	/* Decrypt header && check inner hash */
++	sg_init_one(&sg, header, sizeof(*header));
++	steg_set_key(cipher_tfm, a->header_key);
++	crypto_blkcipher_decrypt(&cipher_desc, &sg, &sg, sg.length);
++	sg_init_one(&sg, &ciphertext->header, sizeof(*header) - 32);
++	crypto_hash_digest(&hash_desc, &sg, sg.length, hash);
++	if(memcmp(hash, header->inner_hash, 32)) {
++		a->ti->error = "load_header: no aspect header at given address";
++		goto end;
++	}
++	/* Load infos */
++	a->version = le64_to_cpu(header->version);
++	if(a->version != ASPECT_HEADER_VERSION) {
++		a->ti->error = "load_header: wrong aspect header version";
++		goto end;
++	}
++	a->sequence = le64_to_cpu(header->sequence);
++	if(le64_to_cpu(header->blocks) > (u64)INT_MAX) {
++		a->ti->error = "load_header: too many blocks";
++		goto end;
++	}
++	a->blocks = le64_to_cpu(header->blocks);
++	if(le64_to_cpu(header->block_bytes) > (u64)INT_MAX) {
++		a->ti->error = "load_header: blocks too large";
++		goto end;
++	}
++	a->block_bytes = le64_to_cpu(header->block_bytes);
++	if(a->block_bytes >> (ffs64(a->block_bytes) - 1) != 1) {
++		a->ti->error = "load_header: block size not a power of 2";
++		goto end;
++	}
++	if(le64_to_cpu(header->atom_bytes) > PAGE_SIZE) {
++		a->ti->error = "load_header: atoms larger than PAGE_SIZE";
++		goto end;
++	}
++	if(le64_to_cpu(header->atom_bytes) < 512) {
++		a->ti->error = "load_header: atoms smaller than one sector";
++		goto end;
++	}
++	a->atom_bytes = le64_to_cpu(header->atom_bytes);
++	if(a->atom_bytes >> (ffs64(a->atom_bytes) - 1) != 1) {
++		a->ti->error = "load_header: atom size not a power of 2";
++		goto end;
++	}
++	a->encryption = le64_to_cpu(header->encryption);
++	if((u32)a->encryption > 1) {
++		a->ti->error = "load_header: encryption > 1 not supported";
++		goto end;
++	}
++	a->journalling = le64_to_cpu(header->journalling);
++	if((u32)a->journalling > 1) {
++		a->ti->error = "load_header: journalling must be boolean";
++		goto end;
++	}
++	a->shuffling = le64_to_cpu(header->shuffling);
++	if((u32)a->shuffling > 1) {
++		a->ti->error = "load_header: shuffling must be boolean";
++		goto end;
++	}
++	a->journal_offset = le64_to_cpu(header->journal_offset);
++	a->keyfrags_offset = le64_to_cpu(header->keyfrags_offset);
++	a->index_offset = le64_to_cpu(header->index_offset);
++	a->parent_level = le64_to_cpu(header->parent_level);
++	memcpy(&a->parent_pass_hash, header->parent_pass_hash, KEY_BYTES);
++	memcpy(&a->header_block_data, &header->header_block_data,
++							sizeof(struct block));
++	memcpy(a->salt, header->salt, SALT_BYTES);
++	memset(a->name, 0, ASPECT_NAME_BYTES);
++	strncpy(a->name, header->name, ASPECT_NAME_BYTES - 1);
++
++	/* Calculate helpful extras */
++	a->block_shift = ffs64(a->block_bytes) - 1;
++	a->bytes = (u64)a->blocks << a->block_shift;
++	a->block_mask = ~(u64)(a->block_bytes - 1);
++	a->atom_shift = ffs64(a->atom_bytes) - 1;
++	a->atom_mask = ~(u64)(a->atom_bytes - 1);
++	a->meta_atom_bytes = a->atom_bytes - sizeof(struct meta_tail);
++	a->atoms_per_block = a->block_bytes >> a->atom_shift;
++
++	if(get_offset(a, &header->header_block_data) != header_block_offset) {
++		DMINFO("header reckons its at %llx", get_offset(a,
++				&header->header_block_data));
++		a->ti->error = "header confused about it's offset";
++		goto end;
++	}
++
++	/* Load seed keyfrag */
++	a->atom_keyfrag = alloc_page_array(roundup(a->atoms_per_block
++			* sizeof(struct keyfrag), a->meta_atom_bytes), 0);
++	if(!a->atom_keyfrag) {
++		a->ti->error = "load_header: failed to alloc a->atom_keyfrag";
++		e = -ENOMEM;
++		goto end;
++	}
++	memcpy(get_keyfrag_address(a, get_seed_keyfrag(a)),
++				&header->seed_keyfrag, sizeof(struct keyfrag));
++	DMINFO("loaded header for aspect %s", a->name);
++	e = 0;
++	end:
++	kzfree(ciphertext);
++	crypto_free_hash(hash_tfm);
++	crypto_free_blkcipher(cipher_tfm);
++	return e;
++}
++
++/* *data must be a->atom_bytes. Use write_meta_data() if you don't want *data
++ * overwriting */
++static int write_meta_atom(struct aspect *a, u64 offset, void *data, int flags)
++{
++	u8 key[KEY_BYTES];
++	struct blkcipher_desc desc;
++	struct scatterlist sg;
++	int e;
++	struct keyfrag *keyfrag = get_atom_keyfrag(a, offset);
++	struct crypto_blkcipher *tfm;
++	tfm = crypto_alloc_blkcipher("sxts(aes)", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(tfm))
++		return PTR_ERR(tfm);
++
++	desc.tfm = tfm;
++	desc.flags = 0;
++	get_random_bytes(data + a->meta_atom_bytes + META_HASH_BYTES,
++								sizeof(u64));
++	if((e = calculate_metadata_hash(a, data, *a->header_block, keyfrag, data
++							+ a->meta_atom_bytes)))
++		goto end;
++
++	if((e = calculate_metadata_key(a, *a->header_block, keyfrag,
++					data + a->meta_atom_bytes, key)))
++		goto end;
++
++	steg_set_key(tfm, key);
++	sg_init_one(&sg, data, a->meta_atom_bytes);
++	crypto_blkcipher_encrypt(&desc, &sg, &sg, sg.length);
++	e = rw_atom(a, get_offset(a, *a->header_block) + (offset &
++					~a->block_mask), data, WRITE | flags);
++	end:
++	crypto_free_blkcipher(tfm);
++	return e;
++}
++
++/* total must be multiple of a->meta_atom_bytes */
++static int write_meta_data(struct aspect *a, u64 index_offset, void **src,
++					size_t src_offset, u64 total, int flags)
++{
++	int e;
++	void *tmp = kmalloc(a->atom_bytes, GFP_NOIO);
++	if(!tmp)
++		return -ENOMEM;
++
++	while(total) {
++		copy_from_array(src, src_offset, tmp, a->meta_atom_bytes);
++		if((e = write_meta_atom(a, index_offset, tmp, flags)))
++			goto end;
++
++		index_offset += a->atom_bytes;
++		src_offset += a->meta_atom_bytes;
++		total -= a->meta_atom_bytes;
++	}
++	end:
++	kzfree(tmp);
++	return e;
++}
++
++static int write_journal_atom(struct aspect *a, int flags)
++{
++	return write_meta_data(a, a->journal_offset, (void *)&a->journal, 0,
++						a->meta_atom_bytes, flags);
++}
++
++/* I have seen steg_map called when steg_dtr is running.
++ * To avoid NULL dereferencing or worse this locking code is used */
++static struct aspect *get_aspect(struct dm_target *ti)
++{
++	struct aspect *a;
++	spin_lock_bh(&steg_global_lock);
++	if(likely((a = ti->private)))
++		atomic_inc(&a->open_interest);
++
++	spin_unlock_bh(&steg_global_lock);
++	return a;
++}
++
++static void put_aspect(struct aspect *a)
++{
++	atomic_dec(&a->open_interest);
++}
++
++static void steg_submit_request(struct steg_request *);
++
++/* Processes FIFO then clears locks. Requires a->shuffle_lock */
++static void unset_rw_locks(struct aspect *a)
++{
++	struct steg_request *r;
++	for(;;) {
++		spin_lock_bh(&a->rw_metalock);
++		if(list_empty(a->fifo))
++			break;
++
++		r = list_first_entry(a->fifo, struct steg_request, list);
++		list_del(a->fifo->next);
++		steg_submit_request(r);
++	}
++	a->read_locked_offset = STEG_UNLOCKED;
++	a->write_locked_offset = STEG_UNLOCKED;
++	spin_unlock_bh(&a->rw_metalock);
++}
++
++/* Requires and releases shuffle lock */
++static void unset_rw_locks_queued(struct work_struct *work)
++{
++	struct steg_request *r = (void *)work;
++	unset_rw_locks(r->a);
++	up(&r->a->shuffle_lock);
++	put_aspect(r->a);
++	kfree(r);
++}
++
++void free_bio(struct bio *bio)
++{
++	while(bio->bi_vcnt)
++		__free_page(bio->bi_io_vec[--bio->bi_vcnt].bv_page);
++
++	bio_put(bio);
++}
++
++static void steg_endio(struct steg_request *r, int e)
++{
++	/* Fastpath encrypted write? */
++	if(r->original) {
++		up_read(&r->a->slowpath_lock);
++		free_bio(r->bio);
++		r->bio = r->original;
++	}
++	if(unlikely(e))
++		r->error = e;
++
++	if(unlikely(r->error))
++		DMINFO("steg_endio ERROR %i r %p bio %p @ %llx size %u vecs %u",
++				r->error, r, r->bio, (u64)r->bio->bi_sector << 9,
++				r->bio->bi_size, r->bio->bi_vcnt);
++	bio_endio(r->bio, r->error);
++
++	if(atomic_dec_and_test(r->requests_running))
++		wake_up(&r->a->requests_running_q);
++
++	/* If this is the last write and a->fifo is not empty, pass the used
++	 * steg_request struct onto unset_rw_locks_queued to trigger flushing.
++	 * If shuffle is running, shuffle will flush when shuffle is finished */
++	if(!(r->bio->bi_rw & WRITE))
++		goto request_ends;
++
++	if(!atomic_dec_and_test(&r->a->writes_in_flight))
++		goto request_ends;
++
++	if(down_trylock(&r->a->shuffle_lock))
++		goto request_ends;
++
++	if(!list_empty(r->a->fifo)) {
++		INIT_WORK(&r->work, unset_rw_locks_queued);
++		queue_work(r->a->shuffle_queue, &r->work);
++		return;
++	}
++	up(&r->a->shuffle_lock);
++
++	request_ends:
++	put_aspect(r->a);
++	kfree(r);
++}
++
++static void steg_dtr(struct dm_target *ti)
++{
++	struct aspect *a = ti->private;
++	/* Stop new requests being serviced */
++	spin_lock_bh(&steg_global_lock);
++	ti->private = NULL;
++	spin_unlock_bh(&steg_global_lock);
++	DMINFO("aspect %s waiting for requests to finish...", a->name);
++	/* Wait for all requests to finish */
++	while(atomic_read(&a->open_interest))
++		schedule();
++
++	/* Queues should now all be empty */
++	if(a->shuffle_queue)
++		destroy_workqueue(a->shuffle_queue);
++
++	if(a->encrypt_queue)
++		destroy_workqueue(a->encrypt_queue);
++
++	if(a->decrypt_queue)
++		destroy_workqueue(a->decrypt_queue);
++
++	/* Close journal if left open */
++	if(a->journal_open)
++		write_journal_atom(a, REQ_FLUSH | REQ_FUA);
++
++	/* free everything */
++	if(a->random_page)
++		free_page((unsigned long)a->random_page);
++
++	if(a->fifo)
++		if(!list_empty(a->fifo))
++			DMERR("steg_dtr: a->fifo not empty!");
++
++	kzfree(a->fifo);
++	kzfree(a->journal);
++	kzfree(a->blocks_in_layer);
++	while(a->pyramid && a->layers--)
++		free_page_array(a->pyramid[a->layers]);
++
++	kzfree(a->pyramid);
++	free_page_array(a->block);
++	free_page_array(a->atom_keyfrag);
++	if(a->device)
++		dm_put_device(ti, a->device);
++
++	DMINFO("aspect %s unloaded", a->name);
++	kzfree(a);
++}
++
++/* Reads ASCII hexadecimal */
++static int read_hex(u8 *out, char *in, int bytes)
++{
++	int i;
++	unsigned int d;
++	char tmpchars[3];
++	if(strlen(in) != bytes * 2)
++		return -EINVAL;
++
++	for(i = 0; i < bytes; i++) {
++		strncpy(tmpchars, &in[i * 2], 2);
++		tmpchars[2] = 0;
++		sscanf(tmpchars, "%2x", &d);
++		out[i] = d;
++	}
++	return 0;
++}
++
++/* <device> <header atom offset> <header atom key in hex> */
++static int steg_ctr(struct dm_target *ti, unsigned int argc, char **argv)
++{
++/* MOAR check for write only and device size */
++	u64 header_block_offset;
++	int e = -ENOMEM;
++	struct aspect *a;
++	if (argc != 3) {
++		ti->error = "three args required";
++		return -EINVAL;
++	}
++	a = kzalloc(sizeof(*a), GFP_KERNEL);
++	if(!a) {
++		ti->error = "kzalloc";
++		return -ENOMEM;
++	}
++	a->fifo = kmalloc(sizeof(struct list_head), GFP_KERNEL);
++	if(!a->fifo) {
++		ti->error = "kmalloc";
++		goto fail;
++	}
++	INIT_LIST_HEAD(a->fifo);
++	spin_lock_init(&a->rw_metalock);
++	sema_init(&a->shuffle_lock, 1);
++	init_rwsem(&a->slowpath_lock);
++	atomic_set(&a->open_interest, 0);
++	atomic_set(&a->writes_in_flight, 0);
++	atomic_set(&a->requests_running_array[0], 0);
++	atomic_set(&a->requests_running_array[1], 0);
++	a->requests_running = &a->requests_running_array[0];
++	a->old_requests_running = &a->requests_running_array[1];
++	init_waitqueue_head(&a->requests_running_q);
++	a->read_locked_offset = -1;
++	a->write_locked_offset = -1;
++	ti->private = a;
++	ti->begin = 0;
++	a->ti = ti;
++	a->header_block = &a->header_block_page_table;
++	a->header_block_page_table = &a->header_block_data;
++	if(dm_get_device(ti, argv[0], dm_table_get_mode(ti->table),
++							&a->device)) {
++		ti->error = "Device lookup failed";
++		goto fail;
++	}
++	if(sscanf(argv[1], "%llu", &header_block_offset) != 1) {
++		ti->error = "Invalid header offset";
++		goto fail;
++	}
++	DMINFO("steg_ctr: header offset: %llx", header_block_offset);
++	if(read_hex(a->header_key, argv[2], KEY_BYTES)) {
++		ti->error = "Bad header atom key";
++		goto fail;
++	}
++	if((e = load_header(a, header_block_offset))) {
++		DMERR("load_header failed");
++		goto fail;
++	}
++	ti->len = a->bytes >> 9;
++	DMINFO("load_header succeeded");
++	if((e = load_keyfrags(a))) {
++		DMERR("load_keyfrags failed");
++		goto fail;
++	}
++	if((e = load_index_table(a))) {	
++		DMERR("load_index_table failed");
++		goto fail;
++	}
++	if(a->journalling) {
++		if((e = load_journal(a))) {
++			DMERR("load_journal failed");
++			goto fail;
++		}
++		if((e = build_pyramid(a))) {
++			DMERR("build_pyramid failed");
++			goto fail;
++		}
++		/* Prevent infinite loop in shuffle code */
++		if(le64_to_cpu(a->journal->shuffles_left) + 1 >
++				a->blocks_in_layer[a->free_block_layer])
++			a->journal->shuffles_left = cpu_to_le64(
++				a->blocks_in_layer[a->free_block_layer] - 1);
++	}
++	if(a->shuffling) {
++		a->shuffle_queue = alloc_workqueue("kstegd_shuffle",
++			WQ_NON_REENTRANT | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
++		if(!a->shuffle_queue) {
++			ti->error = "alloc_workqueue";
++			goto fail;
++		}
++		a->random_page = (void *)__get_free_page(GFP_KERNEL);
++		if(!a->random_page) {
++			ti->error = "kmalloc";
++			goto fail;
++		}
++		get_random_bytes(a->random_page, PAGE_SIZE);
++	}
++	if(a->encryption) {
++		a->decrypt_queue = alloc_workqueue("kstegd_decrypt",
++			WQ_NON_REENTRANT | WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
++		a->encrypt_queue = alloc_workqueue("kstegd_encrypt",
++			WQ_NON_REENTRANT | WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
++		if(!a->decrypt_queue || !a->encrypt_queue) {
++			ti->error = "alloc_workqueue";
++			goto fail;
++		}
++	}
++	ti->num_flush_requests = 1;
++	ti->num_discard_requests = 1;
++	return 0;
++
++	fail:
++	steg_dtr(ti);
++	return e;
++}
++
++/* Used by decrypt_bio_slowpath */
++static int rw_data_atom(struct aspect *a, struct block **index, u64 offset,
++							void *data, int rw)
++{
++	struct crypto_blkcipher *tfm;
++	struct blkcipher_desc desc;
++	struct scatterlist sg;
++	int e;
++	struct block *b = get_block_address(a, index, offset);
++	struct crypto_hash *hash_tfm;
++	if(a->encryption) {
++		tfm = crypto_alloc_blkcipher("sxts(aes)", 0, CRYPTO_ALG_ASYNC);
++		if(unlikely(IS_ERR(tfm))) {
++			e = PTR_ERR(tfm);
++			goto end;
++		}
++		desc.tfm = tfm;
++		desc.flags = 0;
++		hash_tfm = crypto_alloc_hash("sha256", 0, CRYPTO_ALG_ASYNC);
++		if(unlikely(IS_ERR(hash_tfm))) {
++			e = PTR_ERR(hash_tfm);
++			goto free_end;
++		}
++		set_data_atom_key(tfm, a, index, offset, hash_tfm);
++		sg_init_one(&sg, data, a->atom_bytes);
++		if(rw == WRITE)
++			crypto_blkcipher_encrypt(&desc, &sg, &sg, sg.length);
++
++		if(unlikely((e = rw_atom(a, (offset & ~a->block_mask) +
++					get_offset(a, b), data, rw))))
++			goto free_free_end;
++
++		if(rw == READ)
++			crypto_blkcipher_decrypt(&desc, &sg, &sg, sg.length);
++
++		free_free_end:
++		crypto_free_hash(hash_tfm);
++		free_end:
++		crypto_free_blkcipher(tfm);
++	} else {
++		e = rw_atom(a, (offset & ~a->block_bytes) +
++						get_offset(a, b), data, rw);
++	}
++	end:
++	return e;
++}
++
++/* Simple, but very slow */
++static int decrypt_bio_slowpath(struct steg_request *r)
++{
++	struct aspect *a = r->a;
++	struct bio *bio = r->bio;
++	struct bio_vec *bvec = bio->bi_io_vec;
++
++	int e;
++	unsigned int bytes;
++	unsigned int chunk;
++	unsigned int partial = 0;
++	u64 offset = (u64)bio->bi_sector << 9;
++	u64 end = offset + bio->bi_size;
++	u8 *buffer = kmalloc(a->atom_bytes, GFP_NOIO);
++	if(unlikely(!buffer))
++		return -ENOMEM;
++
++	DMWARN("WARNING decrypt_bio_slowpath");
++	while(offset < end) {
++		if((e = rw_data_atom(a, a->block, offset & a->atom_mask,
++								buffer, READ)))
++			goto end;
++
++		bytes = min((unsigned int)(a->atom_bytes - (offset &
++				~a->atom_mask)), (unsigned int)(end - offset));
++		while(bytes) {
++			chunk = min(bytes, bvec->bv_len - partial);
++			memcpy(kmap(bvec->bv_page) + bvec->bv_offset + partial,
++				buffer + (offset & ~a->atom_mask), chunk);
++			kunmap(bvec->bv_page);
++			partial += chunk;
++			if(!(bvec->bv_len - partial)) {
++				bvec++;
++				partial = 0;
++			}
++			offset += chunk;
++			bytes -= chunk;
++		}
++	}
++	e = 0;
++	end:
++	kzfree(buffer);
++	return e;
++}
++
++/* For bios containing only whole aligned pages */
++static int decrypt_bio_fastpath(struct steg_request *r)
++{
++	struct aspect *a = r->a;
++	struct bio *bio = r->bio;
++	struct bio_vec *bvec = bio->bi_io_vec;
++
++	struct scatterlist sg;
++	struct blkcipher_desc desc;
++	struct crypto_blkcipher *cipher_tfm;
++	struct crypto_hash *hash_tfm;
++	u64 offset = (u64)bio->bi_sector << 9;
++	unsigned int bytes_left = bio->bi_size;
++	unsigned int partial;
++	int e = 0;
++
++	cipher_tfm = crypto_alloc_blkcipher("sxts(aes)", 0, CRYPTO_ALG_ASYNC);
++	if(unlikely(IS_ERR(cipher_tfm)))
++		return PTR_ERR(cipher_tfm);
++
++	desc.tfm = cipher_tfm;
++	desc.flags = 0;
++	hash_tfm = crypto_alloc_hash("sha256", 0, CRYPTO_ALG_ASYNC);
++	if(unlikely(IS_ERR(hash_tfm))) {
++		e = PTR_ERR(hash_tfm);
++		goto end_no_hash;
++	}
++	goto first;
++	while(bytes_left -= a->atom_bytes) {
++		partial += a->atom_bytes;
++		offset += a->atom_bytes;
++		if(likely(partial == PAGE_SIZE)) {
++			bvec++;
++			first:
++			partial = 0;
++		}
++		set_data_atom_key(cipher_tfm, a, a->block, offset, hash_tfm);
++		sg_init_one(&sg, kmap(bvec->bv_page) + partial, a->atom_bytes);
++		crypto_blkcipher_decrypt(&desc, &sg, &sg, a->atom_bytes);
++		kunmap(bvec->bv_page);
++	}
++	crypto_free_hash(hash_tfm);
++	end_no_hash:
++	crypto_free_blkcipher(cipher_tfm);
++	return e;
++}
++
++/* Decrypts bio in place. Called by steg_rw_complete(). */
++static void decrypt_bio(struct work_struct *work)
++{
++	struct steg_request *r = (void *)work;
++	int e;
++
++	if(likely(request_contains_only_aligned_pages(r)))
++		e = decrypt_bio_fastpath(r);
++	else
++		e = decrypt_bio_slowpath(r);
++
++	steg_endio(r, e);
++}
++
++/* All bios sent by steg to the underlying device have completed.
++ * Successful encrypted reads move onwards, everything else terminates here */
++static void steg_io_completed(struct steg_request *r)
++{
++	if(!r->error && r->a->encryption && !(r->bio->bi_rw & WRITE)) {
++		INIT_WORK(&r->work, decrypt_bio);
++		queue_work(r->a->decrypt_queue, &r->work);
++		return;
++	}
++	steg_endio(r, 0);
++}
++
++/* (One of) the bio(s) sent to underlying device has completed */
++static void steg_rw_complete(struct bio *bio, int e)
++{
++	struct steg_request *r = bio->bi_private;
++	bio_put(bio);
++	if(unlikely(e))
++		r->error = e;
++
++	if(atomic_dec_and_test(&r->incomplete))
++		steg_io_completed(r);
++}
++
++/* This code makes me a sad panda :(
++ * Hopefully it should never get called */
++static int steg_rw_submit_slowpath(struct steg_request *r)
++{
++	/* FIXME this function is broken */
++	struct aspect *a = r->a;
++	struct bio *bio = r->bio;
++	struct bio_vec *bvec = bio->bi_io_vec;
++
++	struct bio *new_bio;
++	u64 offset = (u64)bio->bi_sector << 9;
++	unsigned int start_vecno;
++	unsigned int vecno;
++	unsigned int partial;
++	unsigned int start_length;
++	unsigned int length;
++	unsigned int max_len = queue_max_sectors(bdev_get_queue(
++							a->device->bdev)) << 9;
++	unsigned int space = a->block_bytes - (offset & ~a->block_mask);
++	DMWARN("WARNING: steg_rw_submit_slowpath");
++
++	partial = 0;
++	vecno = 0;
++	start_length = 0;
++	goto first;
++
++	next_bio:
++	offset += new_bio->bi_size;
++	space = a->block_bytes - (offset % a->block_bytes);
++	atomic_inc(&r->incomplete);
++	submit_bio(bio_rw(bio), new_bio);
++
++	first:
++	/* Work out how many biovecs in new bio; allocate accordingly */
++	length = start_length;
++	start_vecno = vecno;
++	while(vecno < bio->bi_vcnt && length < space && length < max_len)
++		length += bio->bi_io_vec[vecno++].bv_len;
++
++	new_bio = bio_alloc(GFP_NOIO, (vecno - start_vecno) +
++							(start_length ? 1 : 0));
++	if(unlikely(!new_bio))
++		return -ENOMEM;
++
++	new_bio->bi_bdev = a->device->bdev;
++	new_bio->bi_private = r;
++	new_bio->bi_end_io = steg_rw_complete;
++	new_bio->bi_rw |= bio->bi_rw & REQ_FUA;
++	new_bio->bi_sector = translate_address(a, offset) >> 9;
++	/* If biovec was split over block boundary, add remainder */
++	if(unlikely(start_length)) {
++		bvec = &bio->bi_io_vec[start_vecno - 1];
++		bio_add_page(new_bio, bvec->bv_page, bvec->bv_len - partial,
++						bvec->bv_offset + partial);
++	}
++	/* Fill new bio */
++	for(vecno = start_vecno; vecno < bio->bi_vcnt; vecno++) {
++		bvec = &bio->bi_io_vec[vecno];
++		if(new_bio->bi_size + bvec->bv_len > max_len)
++			goto next_bio;
++
++		if(unlikely(bvec->bv_len + new_bio->bi_size > space)) {
++			/* Biovec is split over block boundary - never
++			 * seen it happen but I suppose it's possible */
++			DMWARN("Untested code - split bvec");
++			partial = space - new_bio->bi_size;
++			if(!bio_add_page(new_bio, bvec->bv_page, partial,
++							bvec->bv_offset)) {
++				bio_put(new_bio);
++				return -EIO;
++			}
++			/* Latter half of biovec will go in next bio */
++			start_length = new_bio->bi_size - space;
++			vecno++;
++			goto next_bio;
++		} else {
++			if(!bio_add_page(new_bio, bvec->bv_page, bvec->bv_len,
++							bvec->bv_offset)) {
++				bio_put(new_bio);
++				return -EIO;
++			}
++
++			/* If last bvec in block and not last bvec in
++			 * incoming bio, next new bio */
++			if(new_bio->bi_size == space &&
++						vecno + 1 < bio->bi_vcnt) {
++				start_length = 0;
++				vecno++;
++				goto next_bio;
++			}
++		}
++
++	}
++	atomic_inc(&r->incomplete);
++	submit_bio(bio_rw(bio), new_bio);
++	return 0;
++}
++
++static int steg_rw_submit_fastpath(struct steg_request *r)
++{
++	struct aspect *a = r->a;
++	struct bio *bio = r->bio;
++	struct bio_vec *bvec = bio->bi_io_vec;
++
++	struct bio *new_bio;
++	u64 offset = (u64)bio->bi_sector << 9;
++	unsigned int bvecs = bio->bi_vcnt;
++	unsigned int max_atoms_per_bio = queue_max_sectors(bdev_get_queue(
++				a->device->bdev)) >> (a->atom_shift - 9);
++	unsigned int new_bvecs;
++
++	goto first;
++	while(--bvecs) {
++		bvec++;
++		offset += a->atom_bytes;
++		if(!--new_bvecs) {
++			atomic_inc(&r->incomplete);
++			submit_bio(bio_rw(bio), new_bio);
++		 	first:
++			new_bvecs = min3(max_atoms_per_bio, bvecs,
++					(unsigned int)((a->block_bytes - (offset
++					& ~a->block_mask)) >> a->atom_shift));
++			new_bio = bio_alloc(GFP_NOIO, new_bvecs);
++			if(unlikely(!new_bio))
++				return -ENOMEM;
++
++			new_bio->bi_bdev = a->device->bdev;
++			new_bio->bi_rw |= bio->bi_rw & REQ_FUA;
++			new_bio->bi_private = r;
++			new_bio->bi_end_io = steg_rw_complete;
++			new_bio->bi_sector = translate_address(a, offset) >> 9;
++		}
++		if(unlikely(!bio_add_page(new_bio, bvec->bv_page,
++							PAGE_SIZE, 0))) {
++			DMERR("steg_rw_submit_fastpath: bio_add_page");
++			bio_put(new_bio);
++			return -EIO;
++		}
++	}
++	atomic_inc(&r->incomplete);
++	submit_bio(bio_rw(bio), new_bio);
++	return 0;
++}
++
++/* Handles I/O, but not encryption or decryption */
++static void steg_rw_submit(struct steg_request *r)
++{
++	int e;
++
++	atomic_set(&r->incomplete, 1);
++	r->error = 0;
++
++	if(likely(request_contains_only_aligned_pages(r)))
++		e = steg_rw_submit_fastpath(r);
++	else
++		e = steg_rw_submit_slowpath(r);
++
++	if(e)
++		r->error = e;
++
++	/* If no bios were submitted (an error), or if all bios completed
++	 * before steg_rw_submit_* returned (happens occasionally), then: */
++	if(unlikely(atomic_dec_and_test(&r->incomplete)))
++		steg_io_completed(r);
++}
++
++/* For bios with atoms that are partial, misaligned, or split across biovecs.
++ * Read-modify-write is used, hence slowpath_lock is needed to prevent the
++ * slowpath corrupting other writes. */
++static void encrypt_bio_slowpath(struct steg_request *r)
++{
++	struct aspect *a = r->a;
++	struct bio_vec *bvec = r->bio->bi_io_vec;
++	u64 offset = (u64)r->bio->bi_sector << 9;
++	unsigned int bytes_left = r->bio->bi_size;
++
++	int e = -ENOMEM;
++	unsigned int src_partial = 0;
++	unsigned int chunk;
++	unsigned int bytes;
++	u64 atom_offset;
++	u8 *dst = kmalloc(a->atom_bytes, GFP_NOIO);
++	if(unlikely(!dst))
++		goto no_mem;
++
++	DMWARN("WARNING: encrypt_bio slowpath");
++	down_write(&a->slowpath_lock);
++	while(bytes_left) {
++		atom_offset = offset & a->atom_mask;
++		if((e = rw_data_atom(a, a->block, atom_offset, dst, READ)))
++			goto end;
++
++		bytes = min((unsigned int)(a->atom_bytes -
++					(offset & ~a->atom_mask)), bytes_left);
++		bytes_left -= bytes;
++		while(bytes) {
++			chunk =	min(bytes, bvec->bv_len - src_partial);
++			memcpy(dst + (offset & ~a->atom_mask), src_partial +
++				kmap(bvec->bv_page) + bvec->bv_offset, chunk);
++			kunmap(bvec->bv_page);
++			src_partial += chunk;
++			if(src_partial == bvec->bv_len) {
++				bvec++;
++				src_partial = 0;
++			}
++			offset += chunk;
++			bytes -= chunk;
++
++		}
++		if((e = rw_data_atom(a, a->block, atom_offset, dst, WRITE)))
++			goto end;
++	}
++	e = 0;
++	end:
++	up_write(&a->slowpath_lock);
++	kzfree(dst);
++	no_mem:
++	steg_endio(r, e);
++}
++
++/* If successful, request passed to steg_rw_submit */
++static void encrypt_bio_fastpath(struct steg_request *r)
++{
++	struct aspect *a = r->a;
++	struct bio_vec *bvec = r->bio->bi_io_vec;
++	u64 offset = (u64)r->bio->bi_sector << 9;
++	unsigned int bytes_left = r->bio->bi_size;
++
++	struct blkcipher_desc desc;
++	struct scatterlist dst_sg, src_sg;
++	struct page *dst_page;
++	struct bio *tmp;
++	u8 *dst;
++	struct crypto_blkcipher *cipher_tfm = ERR_PTR(-1);
++	struct crypto_hash *hash_tfm = ERR_PTR(-1);
++	unsigned int src_partial = 0;
++	int e = -ENOMEM;
++	cipher_tfm = crypto_alloc_blkcipher("sxts(aes)", 0, CRYPTO_ALG_ASYNC);
++	if(unlikely(IS_ERR(cipher_tfm)))
++		goto end;
++
++	desc.tfm = cipher_tfm;
++	desc.flags = 0;
++	hash_tfm = crypto_alloc_hash("sha256", 0, CRYPTO_ALG_ASYNC);
++	if(unlikely(IS_ERR(hash_tfm)))
++		goto end;
++
++	tmp = bio_alloc(GFP_NOIO, r->bio->bi_vcnt);
++	if(unlikely(!tmp))
++		goto end;
++
++	/* If r->original != NULL, steg_endio will up_read(&a->slowpath_lock) */
++	r->original = r->bio;
++	r->bio = tmp;
++	down_read(&a->slowpath_lock);
++
++	r->bio->bi_bdev = r->original->bi_bdev;
++	r->bio->bi_rw |= (r->original->bi_rw & REQ_FUA) | REQ_WRITE;
++	r->bio->bi_sector = r->original->bi_sector;
++
++	goto first;
++	while(bytes_left) {
++		src_partial += a->atom_bytes;
++		if(src_partial == PAGE_SIZE) {
++			bvec++;
++			src_partial = 0;
++		}
++		dst += a->atom_bytes;
++		offset += a->atom_bytes;
++		if(!((unsigned long)dst & ~PAGE_MASK)) {
++			if(dst_page) {
++				bio_add_page(r->bio, dst_page, PAGE_SIZE, 0);
++				kunmap(dst_page);
++			}
++			first:
++			if(unlikely(!(dst_page = alloc_page(GFP_NOIO))))
++				goto end;
++
++			dst = kmap(dst_page);
++		}
++		set_data_atom_key(cipher_tfm, a, a->block, offset, hash_tfm);
++		sg_init_one(&src_sg, kmap(bvec->bv_page) + src_partial,
++								a->atom_bytes);
++		sg_init_one(&dst_sg, dst, a->atom_bytes);
++		crypto_blkcipher_encrypt(&desc, &dst_sg, &src_sg,
++								a->atom_bytes);
++		kunmap(bvec->bv_page);
++		bytes_left -= a->atom_bytes;
++	}
++	kunmap(dst_page);
++	bio_add_page(r->bio, dst_page, ((unsigned long)dst & ~PAGE_MASK)
++							+ a->atom_bytes, 0);
++	steg_rw_submit(r);
++	e = 0;
++	end:
++	if(!IS_ERR(cipher_tfm))
++		crypto_free_blkcipher(cipher_tfm);
++	
++	if(!IS_ERR(hash_tfm))
++		crypto_free_hash(hash_tfm);
++
++	if(e)
++		steg_endio(r, e);
++}
++
++static void encrypt_bio(struct work_struct *work)
++{
++	struct steg_request *r = (void *)work;
++
++	if(likely(request_contains_only_aligned_pages(r)))
++		encrypt_bio_fastpath(r);
++	else
++		encrypt_bio_slowpath(r);
++}
++
++static void steg_submit_flush(struct steg_request *r)
++{
++	struct request_queue *q;
++	struct bio *bio;
++	int e = -ENXIO;
++
++	if(!r->a->device->bdev->bd_disk)
++		goto fail;
++
++	if(!(q = bdev_get_queue(r->a->device->bdev)))
++		goto fail;
++
++	if(!q->make_request_fn)
++		goto fail;
++
++	if(!(bio = bio_alloc(GFP_NOIO, 0))) {
++		e = -ENOMEM;
++		goto fail;
++	}
++	atomic_set(&r->incomplete, 1);
++	r->error = 0;
++	bio->bi_end_io = steg_rw_complete;
++	bio->bi_bdev = r->a->device->bdev;
++	bio->bi_private = r;
++	submit_bio(WRITE_FLUSH, bio);
++	return;
++	fail:
++	steg_endio(r, e);
++}
++
++/* Requires a->rw_metalock */
++static int request_must_wait(struct steg_request *r)
++{
++	u64 block_offset, offset;
++	u64 *locked_offset = bio_rw(r->bio) & WRITE ?
++			&r->a->write_locked_offset : &r->a->read_locked_offset;
++	if(*locked_offset == STEG_UNLOCKED)
++		return 0;
++
++	if(*locked_offset == STEG_ALL_LOCKED)
++		return 1;
++
++	if(unlikely(r->bio->bi_rw & REQ_FLUSH)) {
++		/* If any writes are queued or are still being bio_encrypt'ed,
++		 * flush must be queued too. No easy way to check a->fifo for
++		 * writes specifically so we'll queue if a->fifo is not empty */
++		if(!list_empty(r->a->fifo) || atomic_read(
++						&r->a->writes_in_flight))
++			return 1;
++		else
++			return 0;
++	}
++	/* Shuffle in progress; see if bio overlaps locked block */
++	offset = (u64)r->bio->bi_sector << 9;
++	block_offset = offset & r->a->block_mask;
++	while(block_offset < offset + r->bio->bi_size) {
++		if(unlikely(block_offset == *locked_offset))
++			return 1;
++
++		block_offset += r->a->block_bytes;
++	}
++	return 0;
++}
++
++/* Requires and releases a->rw_metalock */
++static void steg_submit_request(struct steg_request *r)
++{
++	r->requests_running = r->a->requests_running;
++	atomic_inc(r->requests_running);
++	spin_unlock_bh(&r->a->rw_metalock);
++
++	if(r->bio->bi_rw & WRITE)
++		atomic_inc(&r->a->writes_in_flight);
++
++	if(unlikely(r->bio->bi_rw & REQ_FLUSH)) {
++		if(r->a->encryption)
++			flush_workqueue(r->a->encrypt_queue);
++
++		steg_submit_flush(r);
++		return;
++	}
++	if(r->bio->bi_rw & WRITE && r->a->encryption) {
++		INIT_WORK(&r->work, encrypt_bio);
++		queue_work(r->a->encrypt_queue, &r->work);
++		return;
++	}
++	steg_rw_submit(r);
++}
++
++static struct steg_request *request_alloc(struct aspect *a, struct bio *bio)
++{
++	struct steg_request *r;
++	if(unlikely(!(r = kzalloc(sizeof(*r), GFP_NOIO))))
++		return NULL;
++
++	r->a = a;
++	r->bio = bio;
++	return r;
++}
++
++/* This is where the bios come in. Wrap them in a steg_request structure, then
++ * either add them to queue, or submit them right away. */
++static int steg_map(struct dm_target *ti, struct bio *bio,
++						union map_info *map_context)
++{
++	struct steg_request *r;
++	struct aspect *a = get_aspect(ti);
++	if(unlikely(!a))
++		return -EIO;
++
++	if(unlikely(((u64)bio->bi_sector << 9) + (u64)bio->bi_size > a->bytes)) {
++		put_aspect(a);
++		return -EIO;
++	}
++
++	if(unlikely(!(r = request_alloc(a, bio)))) {
++		put_aspect(a);
++		return -EIO;
++	}
++
++	spin_lock_bh(&a->rw_metalock);
++	if(unlikely(request_must_wait(r))) {
++		list_add_tail(&r->list, a->fifo);
++		/* Queued flushes cause every subsequent request to queue */
++		if(unlikely(bio->bi_rw & REQ_FLUSH)) {
++			a->read_locked_offset = STEG_ALL_LOCKED;
++			a->write_locked_offset = STEG_ALL_LOCKED;
++		}
++		spin_unlock_bh(&a->rw_metalock);
++	} else {
++		steg_submit_request(r);
++	}
++	return 0;
++}
++
++static int write_keyfrags(struct aspect *a)
++{
++	return write_meta_data(a, a->keyfrags_offset, (void *)a->atom_keyfrag,
++				0, roundup(a->atoms_per_block << KEYFRAG_SHIFT,
++				a->meta_atom_bytes), 0);
++}
++
++static int write_index_table(struct aspect *a)
++{
++	return write_meta_data(a, a->index_offset, (void *)a->block, 0,
++					roundup(a->blocks << BLOCK_SHIFT,
++					a->meta_atom_bytes), 0);
++}
++
++static void fill_in_header_infos(struct aspect *a,
++					struct aspect_disk_header *header)
++{
++	header->version = cpu_to_le64(ASPECT_HEADER_VERSION);
++	header->sequence = cpu_to_le64((a->sequence + 1) % 3);
++	header->blocks = cpu_to_le64(a->blocks);
++	header->block_bytes = cpu_to_le64(a->block_bytes);
++	header->atom_bytes = cpu_to_le64(a->atom_bytes);
++	header->encryption = cpu_to_le64(a->encryption);
++	header->shuffling = cpu_to_le64(a->shuffling);
++	header->journalling = cpu_to_le64(a->journalling);
++	header->journal_offset = cpu_to_le64(a->journal_offset);
++	header->keyfrags_offset = cpu_to_le64(a->keyfrags_offset);
++	header->index_offset = cpu_to_le64(a->index_offset);
++	header->parent_level = cpu_to_le64(a->parent_level);
++	memcpy(header->parent_pass_hash, a->parent_pass_hash, KEY_BYTES);
++	memcpy(&header->header_block_data, &a->header_block_data, KEY_BYTES);
++	memcpy(&header->seed_keyfrag, get_keyfrag_address(a,
++				get_seed_keyfrag(a)), sizeof(struct keyfrag));
++	memcpy(header->salt, a->salt, SALT_BYTES);
++	strncpy(header->name, a->name, ASPECT_NAME_BYTES);
++}
++
++/* Requires a->bunny_seed and a->bunny_output */
++static int write_header_atom(struct aspect *a, int flags)
++{
++	struct crypto_blkcipher *cipher_tfm;
++	struct crypto_hash *hash_tfm;
++	struct blkcipher_desc cipher_desc;
++	struct hash_desc hash_desc;
++	struct scatterlist sg;
++	struct aspect_disk_header_enc *atom;
++	struct aspect_disk_header *header;
++	u8 hash[32];
++	int i, e;
++	if(!(atom = kmalloc(a->atom_bytes, GFP_NOIO))) {
++		return -ENOMEM;
++	}
++	header = &atom->header;
++	hash_tfm = crypto_alloc_hash("sha256", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(hash_tfm)) {
++		e = PTR_ERR(hash_tfm);
++		goto free_exit;
++	}
++	hash_desc.tfm = hash_tfm;
++	hash_desc.flags = 0;
++	cipher_tfm = crypto_alloc_blkcipher("sxts(aes)", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(cipher_tfm)) {
++		e = PTR_ERR(cipher_tfm);
++		goto free_free_exit;
++	}
++	cipher_desc.tfm = cipher_tfm;
++	cipher_desc.flags = 0;
++
++	get_random_bytes(atom, a->atom_bytes);
++	/* Fill out plaintext && inner hash */
++	fill_in_header_infos(a, header);
++	sg_init_one(&sg, header, sizeof(*header) - 32);
++	crypto_hash_digest(&hash_desc, &sg, sg.length, header->inner_hash);
++	/* Calculate key && encrypt */
++	sg_init_one(&sg, a->bunny_output, BUNNY_ENTRY_BYTES);
++	crypto_hash_digest(&hash_desc, &sg, sg.length, hash);
++	steg_set_key(cipher_tfm, hash);
++	sg_init_one(&sg, header, sizeof(*header));
++	crypto_blkcipher_encrypt(&cipher_desc, &sg, &sg, sg.length);
++	/* Set up (bunny seed ^ ciphertext hash) */
++	memcpy(atom->bunny_seed, a->bunny_seed, BUNNY_ENTRY_BYTES);
++	sg_init_one(&sg, header, sizeof(*header));
++	crypto_hash_digest(&hash_desc, &sg, sg.length, hash);
++	for(i = 0; i < 32; i++)
++		atom->bunny_seed[i] ^= hash[i];
++
++	e = rw_atom(a, get_offset(a, *a->header_block), atom, WRITE | flags);
++	if(!e) {
++		/* Use each seed/output pair only once */
++		a->bunny_pair_ready = 0;
++		/* Rock-paper-scissors type header priority */
++		a->sequence++;
++		a->sequence%=3;
++	}
++	crypto_free_blkcipher(cipher_tfm);
++	free_free_exit:
++	crypto_free_hash(hash_tfm);
++	free_exit:
++	kzfree(atom);
++	return e;
++}
++
++/* After, aspect is still loadable from old header. a->sequence prioritises. */
++static int xchg_header(struct aspect *a, struct block *new_block)
++{
++	int e;
++	struct block backup;
++	memcpy(&backup, *a->header_block, sizeof(backup));
++	a->journal->block_being_moved = 0;
++	a->journal->src_offset = -1;
++	a->journal->dst_offset = cpu_to_le64(get_offset(a, *a->header_block));
++	memcpy(*a->header_block, new_block, sizeof(backup));
++
++	if((e = write_keyfrags(a)))
++		goto rollback;
++
++	if((e = write_index_table(a)))
++		goto rollback;
++
++	if((e = write_journal_atom(a, 0)))
++		goto rollback;
++
++	if((e = write_header_atom(a, REQ_FLUSH | REQ_FUA)))
++		goto rollback;
++
++	a->journal_open = 0;
++	return 0;
++
++	rollback:
++	DMWARN("WARNING: xchg_header rollback");
++	memcpy(*a->header_block, &backup, sizeof(struct block));
++	return e;
++}
++
++/* 1. Wait for empty request counter
++ * 2. Set locks
++ * 3. Swap a->requests_running and a->old_requests_running so the former counts
++ * only requests aware of this new locking regime and the latter counts unaware
++ * requests that must be allowed to finish before locking regime is in force.
++ * 4. Wait until new regime is in force */
++static void set_rw_locks(struct aspect *a, u64 read_offset, u64 write_offset)
++{
++	void *tmp;
++	wait_event(a->requests_running_q, !atomic_read(a->old_requests_running));
++	spin_lock_bh(&a->rw_metalock);
++	if(a->read_locked_offset != STEG_ALL_LOCKED) {
++		a->read_locked_offset = read_offset;
++		a->write_locked_offset = write_offset;
++	}
++	tmp = a->requests_running;
++	a->requests_running = a->old_requests_running;
++	a->old_requests_running = tmp;
++	spin_unlock_bh(&a->rw_metalock);
++	wait_event(a->requests_running_q, !atomic_read(a->old_requests_running));
++}
++
++/* Returns number of bytes rw'd, or error if less than 1 page rw'd.*/
++static int data_rw(struct aspect *a, u64 base, unsigned int limit,
++						struct page **pages, int rw)
++{
++	DECLARE_WAIT_QUEUE_HEAD(q);
++	struct bio *bio;
++	struct steg_request *r;
++	unsigned int bytes = 0;
++	unsigned int bio_max_pages = queue_max_sectors(bdev_get_queue(
++					a->device->bdev)) >> (PAGE_SHIFT - 9);
++	struct bio_meta meta = { .error = 0, .q = &q };
++	atomic_set(&meta.incomplete, 0);
++	while(bytes < limit && *pages) {
++		if(!(bio = bio_alloc(GFP_NOIO, bio_max_pages)))
++			goto end;
++
++		bio->bi_bdev = a->device->bdev;
++		bio->bi_private = &meta;
++		bio->bi_end_io = bio_complete;
++		bio->bi_sector = (base + bytes) >> 9;
++		bio->bi_rw |= rw;
++
++		while(bytes < limit && *pages) {
++			if(!bio_add_page(bio, *pages, PAGE_SIZE, 0))
++				break;
++
++			pages++;
++			bytes += PAGE_SIZE;
++		}
++		if(!bio->bi_vcnt) {
++			bio_put(bio);
++			goto end;
++		}
++		if(!(r = request_alloc(a, bio))) {
++			pages -= bio->bi_vcnt;
++			bytes -= bio->bi_size;
++			bio_put(bio);
++			goto end;
++		}
++		atomic_inc(&meta.incomplete);
++		atomic_inc(&a->open_interest);
++		spin_lock_bh(&a->rw_metalock);
++		steg_submit_request(r);
++	}
++	end:
++	wait_event(q, !atomic_read(&meta.incomplete));
++	return meta.error ? : (bytes ? : -ENOMEM);
++}
++
++static int copy_data_block(struct aspect *a, struct block *new_block, u64 base)
++{
++	struct page **pages;
++	struct page **write_idx;
++	int i, e;
++	unsigned int bytes_read = 0;
++	unsigned int bytes_written = 0;
++	unsigned int bytes = min((unsigned int)(16 << 20), a->block_bytes);
++	/* Allocate at least an 8th of what we ideally want */
++	for(i = 0; i < 4; i++, bytes >>= 1)
++		if((pages = alloc_page_array(bytes, 1)))
++			break;
++
++	if(!pages)
++		return -ENOMEM;
++
++	/* Hack: block just past end of aspect is used as target for shuffles */
++	memcpy(get_block_address(a, a->block, a->blocks << a->block_shift),
++					new_block, sizeof(struct block));
++	while(bytes_written < a->block_bytes) {
++		e = data_rw(a, base + bytes_read, a->block_bytes - bytes_read,
++								pages, READ);
++		if(e < 0)
++			break;
++
++		bytes_read += e;
++		write_idx = pages;
++		while(bytes_written < bytes_read) {
++			e = data_rw(a, (a->blocks << a->block_shift) +
++				bytes_written, bytes_read - bytes_written,
++							write_idx, WRITE);
++			if(e < 0)
++				break;
++
++			write_idx += e >> PAGE_SHIFT;
++			bytes_written += e;
++		}
++	}
++	memset(get_block_address(a, a->block, a->blocks << a->block_shift),
++						0, sizeof(struct block));
++	for(i = 0; pages[i]; i++)
++		__free_page(pages[i]);
++
++	kfree(pages);
++
++	return bytes_written == a->block_bytes ? 0 : e;
++}
++
++static int xchg_data_block(struct aspect *a, struct block *new_block, u64 p)
++{
++	int e;
++	struct block backup;
++	u64 index_atom;
++	u64 disk_offset;
++	unsigned int mem_offset;
++	struct block *src_block = get_block_from_pyramid(a, p);
++	void *data = kmalloc(a->atom_bytes, GFP_NOIO);
++	if(!data)
++		return -ENOMEM;
++
++	memcpy(&backup, src_block, sizeof(*src_block));
++	a->journal->block_being_moved = cpu_to_le64(p);
++	a->journal->src_offset = cpu_to_le64(get_offset(a, src_block));
++	write_journal_atom(a, REQ_FUA);
++	/* Stop writes to block */
++	set_rw_locks(a, STEG_UNLOCKED, get_offset(a, src_block));
++	if(blkdev_issue_flush(a->device->bdev, GFP_NOIO, NULL))
++		goto rollback;
++
++	if((e = copy_data_block(a, new_block, pyramid_blocknum(p)
++							<< a->block_shift)))
++		goto rollback;
++
++	/* Stop reads and writes to block */
++	set_rw_locks(a, get_offset(a, src_block), get_offset(a, src_block));
++
++	/* Update in-memory and on-disk index tables */
++	memcpy(src_block, new_block, sizeof(struct block));
++	index_atom = pyramid_blocknum(p);
++	do_div(index_atom, a->meta_atom_bytes >> BLOCK_SHIFT);
++	disk_offset = a->index_offset + (index_atom << a->atom_shift);
++	mem_offset = index_atom;
++	mem_offset *= a->meta_atom_bytes;
++	if((e = write_meta_data(a, disk_offset, (void *)a->block, mem_offset,
++				a->meta_atom_bytes, REQ_FLUSH | REQ_FUA)))
++		goto rollback;
++
++	/* Journal can be closed later */
++	a->journal->block_being_moved = 0;
++	a->journal->dst_offset = a->journal->src_offset;
++	a->journal->src_offset = -1;
++	a->journal_open = 1;
++	end:
++	unset_rw_locks(a);
++	kzfree(data);
++	return e;
++	rollback:
++	DMWARN("WARNING: xchg_data_block rollback");
++	memcpy(src_block, &backup, sizeof(struct block));
++	goto end;
++}
++
++/* Slow, but only needed once per depromotion */
++static u64 *find_pyramid_block(struct aspect *a, u64 p)
++{
++	int i, layer;
++	u64 *ptr;
++	for(layer = 0; layer < a->layers; layer++) {
++		for(i = 0; i < a->blocks_in_layer[layer]; i++) {
++			ptr = &a->pyramid[layer][i >> U64_PAGE_SHIFT][i &
++								~U64_PAGE_MASK];
++			if(*ptr == p) {
++				DMINFO("find_pyramid_block: %llx on layer %i",
++								p, layer);
++				return ptr;
++			}
++		}
++	}
++	DMERR("find_pyramid_block: couldn't find block %llx", p);
++	return NULL;
++}
++
++/* Initiates shuffle operation. Manages pyramid. Requires a->shuffle_lock */
++static void shuffle(struct work_struct *work)
++{
++	struct aspect_disk_journal *old_journal;
++	struct block new_block;
++	int target_block_num;
++	int e;
++	int promoting = 0;
++	int depromoting = 0;
++	u64 *target_block = NULL;
++	struct aspect *a = ((struct steg_request *)work)->a;
++	int target_layer = a->free_block_layer;
++	kfree(work);
++	if(!a->shuffling) {
++		DMERR("shuffle ignored: shuffling disabled for this aspect");
++		goto unlock_return;
++	}
++	if(!a->journalling) {
++		DMERR("unjournalled shuffling not supported");
++		goto unlock_return;
++	}
++	/* Save a copy of the journal, for rollback */
++	old_journal = kmalloc(a->atom_bytes, GFP_NOIO);
++	if(!old_journal)
++		goto unlock_return;
++
++	memcpy(old_journal, a->journal, a->meta_atom_bytes);
++	/* Is the next shuffle inter-layer ? */
++	if(a->layers == 1)
++		a->journal->shuffles_left = cpu_to_le64(1);
++
++	if(!a->journal->shuffles_left) {
++		DMINFO("inter-layer shuffle");
++		if(!target_layer)
++			a->journal->ascending = 0;
++
++		if(target_layer == a->layers - 1)
++			a->journal->ascending = cpu_to_le64(1);
++
++		if(a->journal->ascending) {
++			/* free block moves up pyramid */
++			depromoting = 1;
++			target_layer--;
++			target_block = find_pyramid_block(a, le64_to_cpu(
++				a->journal->promoted[a->blocks_promoted - 1]));
++			a->journal->promoted[a->blocks_promoted - 1] = 0;
++		} else {
++			/* free block moves down pyramid */
++			promoting = 1;
++			target_layer++;
++		}
++		a->journal->shuffles_left = cpu_to_le64(
++				a->blocks_in_layer[target_layer]);
++	}
++	a->journal->shuffles_left = cpu_to_le64(le64_to_cpu(
++				a->journal->shuffles_left) - 1);
++	/* Retry aborted header shuffle? */
++	if(a->shuffle_target) {
++		target_block = a->shuffle_target;
++		a->shuffle_target = NULL;
++		DMINFO("retrying shuffle");
++	}
++	/* If choice not made already, select random block from target layer */
++	if(!target_block) {
++		get_random_bytes(&target_block_num, sizeof(target_block_num));
++		do {
++			target_block_num %= a->blocks_in_layer[target_layer];
++			target_block = &a->pyramid[target_layer]
++				[target_block_num >> U64_PAGE_SHIFT]
++				[target_block_num & ~U64_PAGE_MASK];
++			target_block_num++;
++		} while(target_block == a->free_pyramid_block);
++	}
++	if(promoting) {
++		a->journal->promoted[a->blocks_promoted] =
++						cpu_to_le64(*target_block);
++		a->journal->promoted[a->blocks_promoted + 1] = 0;
++	}
++	xor_random(&new_block, get_block_from_pyramid(a, *target_block),
++							sizeof(struct block));
++	set_offset(a, &new_block, le64_to_cpu(a->journal->dst_offset));
++	if(pyramid_type(*target_block) == PYRAMID_HEADER)
++		e = xchg_header(a, &new_block);
++	else
++		e = xchg_data_block(a, &new_block, *target_block);
++
++	if(e)
++		goto rollback;
++
++	/* Great success */
++	a->blocks_promoted += promoting;
++	a->blocks_promoted -= depromoting;
++	*a->free_pyramid_block = *target_block;
++	a->free_pyramid_block = target_block;
++	*a->free_pyramid_block = PYRAMID_FREE_BLOCK;
++	a->free_block_layer = target_layer;
++	end:
++	kzfree(old_journal);
++	unlock_return:
++	up(&a->shuffle_lock);
++	return;
++	rollback:
++	DMWARN("shuffle failed. rolling back journal.");
++	memcpy(a->journal, old_journal, a->meta_atom_bytes);
++	write_journal_atom(a, REQ_FLUSH | REQ_FUA);
++	a->journal_open = 0;
++	goto end;
++}
++
++/* Check userland has calculated correct old_output. If so, accept keys.
++ * Check is unnecessary, but very sensible */
++static int set_bunny_data(struct aspect *a, u8 *old_output_ascii,
++					u8 *seed_ascii, u8 *output_ascii)
++{
++	struct crypto_hash *hash_tfm;
++	struct hash_desc desc;
++	struct scatterlist sg;
++	u8 calc_header_key[KEY_BYTES];
++	u8 old_output[BUNNY_ENTRY_BYTES];
++	int e = -EINVAL;
++	hash_tfm = crypto_alloc_hash("sha256", 0, CRYPTO_ALG_ASYNC);
++	if(IS_ERR(hash_tfm))
++		return PTR_ERR(hash_tfm);
++
++	desc.tfm = hash_tfm;
++	desc.flags = 0;
++	if(read_hex(old_output, old_output_ascii, BUNNY_ENTRY_BYTES))
++		goto fail;
++
++	sg_init_one(&sg, old_output, BUNNY_ENTRY_BYTES);
++	crypto_hash_digest(&desc, &sg, sg.length, calc_header_key);
++	if(memcmp(calc_header_key, a->header_key, KEY_BYTES))
++		goto fail;
++
++	if(read_hex(a->bunny_seed, seed_ascii, BUNNY_ENTRY_BYTES))
++		goto fail;
++
++	if((e = read_hex(a->bunny_output, output_ascii, BUNNY_ENTRY_BYTES)))
++		goto fail;
++
++	a->bunny_pair_ready = 1;
++	DMINFO("accepted bunny seed/output pair");
++	goto end;
++	fail:
++	DMWARN("set_bunny_data: not accepting bunny pair");
++	end:
++	crypto_free_hash(hash_tfm);
++	return e;
++}
++
++/* Device mapper messages come in here */
++static int steg_message(struct dm_target *ti, unsigned argc, char **argv)
++{
++	int e = -EINVAL;
++	struct steg_request *r;
++	struct aspect *a = get_aspect(ti);
++	if(!a) {
++		return -EIO;
++	}
++	if(argc < 1) {
++		goto fail;
++	}
++	if(!strncmp(argv[0], MESG_STR("shuffle"))) {
++		if(down_trylock(&a->shuffle_lock)) {
++			DMWARN("shuffle: can't get shuffle lock");
++			e = -EBUSY;
++			goto end;
++		}
++		if(!list_empty(a->fifo)) {
++			e = -EBUSY;
++			goto unlock_end;
++		}
++		if(!a->bunny_pair_ready) {
++			e = -ENOKEY;
++			goto unlock_end;
++		}
++		if(!(r = request_alloc(a, NULL))) {
++			e = -ENOMEM;
++			goto unlock_end;
++		}
++		INIT_WORK(&r->work, shuffle);
++		queue_work(a->shuffle_queue, &r->work);
++		e = 0;
++		goto end;
++	}
++	if(!strncmp(argv[0], MESG_STR("bunnypair"))) {
++		if(argc < 4) {
++			goto fail;
++		}
++		if(down_trylock(&a->shuffle_lock)) {
++			DMWARN("bunnypair: can't get shuffle lock");
++			e = -EBUSY;
++			goto end;
++		}
++		e = set_bunny_data(a, argv[1], argv[2], argv[3]);
++		goto unlock_end;
++	}
++	fail:
++	DMWARN("u wot m8?");
++	goto end;
++	unlock_end:
++	up(&a->shuffle_lock);
++	end:
++	put_aspect(a);
++	return e;
++}
++
++static struct target_type steg_target = {
++	.name   = "steg",
++	.version = {1, 0, 0},
++	.module = THIS_MODULE,
++	.ctr    = steg_ctr,
++	.dtr    = steg_dtr,
++	.map    = steg_map,
++	.message = steg_message,
++};
++
++static int __init dm_steg_init(void)
++{
++	int e = dm_register_target(&steg_target);
++	if (e < 0) {
++		DMERR("register failed %d", e);
++	} else {
++		DMINFO("dm-steg loaded");
++	}
++	return e;
++}
++
++static void __exit dm_steg_exit(void)
++{
++	dm_unregister_target(&steg_target);
++	DMINFO("dm-steg unloaded");
++}
++
++module_init(dm_steg_init)
++module_exit(dm_steg_exit)
++
++MODULE_AUTHOR("Leopold Samulis <anagon@gmail.com>");
++MODULE_DESCRIPTION(DM_NAME " deniably encrypted block device");
++MODULE_LICENSE("GPL");	/* Public domain linked to GPL -> effectively GPL */
+diff -uNr original/drivers/md/dm-steg.h modified/drivers/md/dm-steg.h
+--- original/drivers/md/dm-steg.h	1970-01-01 01:00:00.000000000 +0100
++++ modified/drivers/md/dm-steg.h	2011-11-25 22:34:44.863073246 +0000
+@@ -0,0 +1,199 @@
++/* dm-steg.h - definitions for dm-steg kernel module.
++ * all u64's in on-disk and dual-purpose structures are little endian.
++ * memory-only u64's are host byte order */
++
++#define TO_ARRAY		0
++#define FROM_ARRAY		1
++
++#define MINIMUM_BLOCK_BITS	16
++#define MINIMUM_BLOCK_BYTES	(1 << MINIMUM_BLOCK_BITS)
++#define MINIMUM_ATOM_BYTES	512 
++
++#define KEY_BYTES		32
++#define SALT_BYTES		56
++#define BUNNY_ENTRY_BYTES	64
++#define META_HASH_BYTES		24
++#define HEADER_HASH_BYTES	32
++#define ASPECT_NAME_BYTES	64
++
++#define KEYFRAG_SHIFT		5
++#define KEYFRAG_BYTES		(1 << KEYFRAG_SHIFT)
++#define KEYFRAG_PAGE_SHIFT	(PAGE_SHIFT - KEYFRAG_SHIFT)
++#define KEYFRAG_PAGE_MASK	(~((1 << KEYFRAG_PAGE_SHIFT) - 1))
++
++#define BLOCK_SHIFT		KEYFRAG_SHIFT
++#define BLOCK_PAGE_SHIFT	KEYFRAG_PAGE_SHIFT
++#define BLOCK_PAGE_MASK		KEYFRAG_PAGE_MASK
++
++#define U64_PAGE_SHIFT		(PAGE_SHIFT - 3)
++#define U64_PAGE_MASK		(~((1 << U64_PAGE_SHIFT) - 1))
++
++#define ASPECT_HEADER_VERSION	1
++#define ASPECT_HEADER_MAGIC	0x21616172646e7550
++
++#define MESG_STR(x)		x, sizeof(x)
++
++struct keyfrag {
++	u8 d[KEYFRAG_BYTES];
++};
++
++/* offset is byte offset into block device and also first 8 bytes of block
++ * keyfrag. Little endian. */
++struct block {
++	u64 offset;
++	u8 rest[KEYFRAG_BYTES - sizeof(u64)];
++};
++
++/* pyramid format: upper 2 bits: 01 = data block, 10 = index block,
++ * 11 = the header block. lower 62 bits = block num within index */
++#define MAX_LAYERS		(65 - MINIMUM_BLOCK_BITS)
++#define pyramid_type(x)		((x)&((u64)3<<62))
++#define pyramid_blocknum(x)	((x)&~((u64)3<<62))
++#define PYRAMID_HEADER		((u64)2<<62)
++#define PYRAMID_DATA		((u64)1<<62)
++#define PYRAMID_FREE_BLOCK	0
++
++#define STEG_UNLOCKED		(-1)
++#define STEG_ALL_LOCKED		(-2)
++
++struct bio_meta {
++	wait_queue_head_t *q;
++	atomic_t incomplete;
++	int error;
++};
++
++struct steg_request {
++	struct work_struct work;	/* for encrypt/decrypt workqueues */
++	struct list_head list;		/* for adding to a->fifo */
++	struct aspect *a;		/* aspect to which request belongs */
++	struct bio *bio;		/* given to steg_map by DM layer */
++	struct bio *original;		/* for encrypted writes */
++	atomic_t *requests_running;	/* we decrement this when finished */
++	atomic_t incomplete;		/* number of bios generated */
++	int error;
++};
++
++/* journal logs shuffles to avoid data loss or metadata corruption if power
++ * failure occurs. Also keeps track of alignment pyramid so blocks do not
++ * become less aligned. All little endian */
++struct aspect_disk_journal {
++	u64 block_being_moved;		/* or 0 if none */
++	u64 src_offset;			/* offset into block device */
++	u64 dst_offset;			/* offset into block device */
++	u64 ascending;			/* if 1, next layer is up (layer--) */
++	u64 shuffles_left;		/* shuffles left before next layer */
++	u64 promoted[0];		/* 0-term'd list of promoted blocks */
++};
++
++/* All host byte order */
++struct aspect {
++	struct dm_target *ti;
++	struct dm_dev *device;
++
++	struct list_head *fifo;
++	struct workqueue_struct *decrypt_queue;
++	struct workqueue_struct *encrypt_queue;
++	struct workqueue_struct *shuffle_queue;
++
++	struct block **block;
++	struct keyfrag **atom_keyfrag;
++
++	struct block **header_block;
++	struct block *header_block_page_table;
++	struct block header_block_data;
++
++	/* From header */
++	unsigned int version;
++	unsigned int sequence;
++	unsigned int blocks;
++	unsigned int block_bytes;
++	unsigned int atom_bytes;
++	unsigned int encryption;
++	unsigned int shuffling;
++	unsigned int journalling;
++	unsigned int journal_offset;
++	unsigned int keyfrags_offset;
++	unsigned int index_offset;
++	unsigned int parent_level;
++	u8 parent_pass_hash[KEY_BYTES];
++	u8 salt[SALT_BYTES];
++	char name[ASPECT_NAME_BYTES];
++
++	/* Calculated */
++	u64 bytes;				/* Aspect internal size */
++	u64 block_mask;
++	u64 atom_mask;
++	unsigned int block_shift;
++	unsigned int atom_shift;
++	unsigned int meta_atom_bytes;
++	unsigned int atoms_per_block;
++
++	/* For shuffling */
++	struct aspect_disk_journal *journal;
++	u64 ***pyramid;
++	u64 *free_pyramid_block;
++	u64 *shuffle_target;
++	unsigned int *blocks_in_layer;
++	void *random_page;
++	u8 bunny_seed[BUNNY_ENTRY_BYTES];
++	u8 bunny_output[BUNNY_ENTRY_BYTES];
++	u8 header_key[KEY_BYTES];		/* Set once, on aspect load */
++	u8 header_rndhash[64];			/* Set once, on aspect load */
++	unsigned int layers;
++	unsigned int free_block_layer;
++	unsigned int bunny_pair_ready;
++	unsigned int journal_open;
++	unsigned int blocks_promoted;
++
++	/* For locking */
++	atomic_t open_interest;
++	spinlock_t rw_metalock;
++	atomic_t requests_running_array[2];
++	atomic_t *requests_running;
++	atomic_t *old_requests_running;
++	wait_queue_head_t requests_running_q;
++	u64 read_locked_offset;
++	u64 write_locked_offset;
++	atomic_t writes_in_flight;
++	struct rw_semaphore slowpath_lock;
++	struct semaphore shuffle_lock;
++};
++
++/* Encrypted and stored in header sector */
++/* All u64s little endian */
++struct aspect_disk_header {
++	u64 version;				/* Encryption starts here */
++	u64 sequence;				/* For header block shuffles */
++	u64 blocks;				/* Number of data blocks */
++	u64 block_bytes;			/* Size of blocks */
++	u64 atom_bytes;				/* Size of constituent atoms */
++	u64 encryption;				/* For data blocks only */
++	u64 shuffling;				/* Boolean */
++	u64 journalling;			/* Boolean */
++	u64 journal_offset;			/* In bytes */
++	u64 keyfrags_offset;			/* ditto */
++	u64 index_offset;			/* ditto */
++	u64 parent_level;			/* or -1 for no parent */
++
++	u8 parent_pass_hash[KEY_BYTES];		/* for loading parent aspect */
++
++	struct block header_block_data;		/* for bootstrapping */
++	struct keyfrag seed_keyfrag;		/* for bootstrapping */
++	u8 salt[SALT_BYTES];			/* for hash input padding */
++
++	char name[ASPECT_NAME_BYTES];
++	char padding[104];
++	u8 inner_hash[32];			/* SHA-256 of plaintext */
++};
++
++/* Header sector format. 512 bytes total */
++struct aspect_disk_header_enc {
++	u8 bunny_seed[BUNNY_ENTRY_BYTES];
++	struct aspect_disk_header header;
++};
++
++/* At end of every meta atom */
++struct meta_tail {
++	u8 hash[META_HASH_BYTES];
++	u64 rnd64;
++};
+diff -uNr original/include/asm-generic/bitops/ffs64.h modified/include/asm-generic/bitops/ffs64.h
+--- original/include/asm-generic/bitops/ffs64.h	1970-01-01 01:00:00.000000000 +0100
++++ modified/include/asm-generic/bitops/ffs64.h	2011-11-24 16:44:31.867298266 +0000
+@@ -0,0 +1,41 @@
++#ifndef _ASM_GENERIC_BITOPS_FFS64_H_
++#define _ASM_GENERIC_BITOPS_FFS64_H_
++
++/*
++ * ffs64 - find first bit set
++ * @x: the word to search
++ */
++static inline int ffs64(u64 x)
++{
++	int r = 1;
++
++	if (!x)
++		return 0;
++	if (!(x & 0xffffffff)) {
++		x >>= 32;
++		r += 32;
++	}
++	if (!(x & 0xffff)) {
++		x >>= 16;
++		r += 16;
++	}
++	if (!(x & 0xff)) {
++		x >>= 8;
++		r += 8;
++	}
++	if (!(x & 0xf)) {
++		x >>= 4;
++		r += 4;
++	}
++	if (!(x & 3)) {
++		x >>= 2;
++		r += 2;
++	}
++	if (!(x & 1)) {
++		x >>= 1;
++		r += 1;
++	}
++	return r;
++}
++
++#endif /* _ASM_GENERIC_BITOPS_FFS64_H_ */

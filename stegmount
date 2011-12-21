@@ -1,0 +1,77 @@
+#! /bin/bash
+# stegmount: helper script for mounting filesystems inside aspects
+
+# 1. If file, setup loopback device
+# 2. Run stegsetup to create /dev/mapper/stegX device(s)
+# 3. Mount the innermost aspect's filesystem
+
+device="$1"
+mountpoint="$2"
+
+if [ "`whoami`" != "root" ] ; then
+	echo "Error: not root."
+	exit 1
+fi
+
+if [ -z "$device" -o -z "$mountpoint" ] ; then
+	echo "Usage: $0 <device> <mount point>"
+	exit 1
+fi
+
+if [ ! -e "$device" ] ; then
+	echo "$device does not exist"
+	exit 1
+fi
+
+if [ ! -b "$device" -a ! -f "$device" ] ; then
+	echo "$device not a block device and not a file"
+	exit 1
+fi
+
+if [ ! -d "$mountpoint" ] ; then
+	echo "$mountpoint not a directory"
+	exit 1
+fi
+
+if [ -f "$device" ] ; then
+	loopdev=`losetup -f`
+	if [ ! -b "$loopdev" ] ; then
+		echo "Can't get free loopback device"
+	fi
+	if ! losetup "$loopdev" "$device" ; then
+		echo "Failed to setup $loopdev"
+		exit 1
+	fi
+	device="$loopdev"
+	echo "Created: $loopdev"
+fi
+
+tmpfile=`mktemp`
+
+if ! stegsetup "$device" "$tmpfile" ; then
+	if [ -n "$loopdev" ] ; then
+		echo "Removing $loopdev... "
+		losetup -d "$loopdev"
+	fi
+	echo "stegsetup failed."
+	rm -f "$tmpfile"
+	exit 1
+fi
+
+INNERMOST=`tail -n1 "$tmpfile"`
+
+if ! mount "$INNERMOST" "$mountpoint" ; then
+	tac "$tmpfile" | while read aspect ; do
+		echo -n "Removing $aspect... "
+		dmsetup remove "$aspect"	# unload the aspect
+		stegctl remove "$aspect"	# tell stegd it's gone
+	done
+	if [ -n "$loopdev" ] ; then
+		echo "Removing $loopdev... "
+		losetup -d "$loopdev"
+	fi
+	echo "Failed to mount aspect"
+else
+	echo "Success: filesystem mounted on $mountpoint"
+fi
+#rm -f "$tmpfile"
